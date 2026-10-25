@@ -21,12 +21,14 @@ REPO_NAME="${1:?Usage: discover-sessions.sh <repo-name> <days> [--cwd /abs/repo/
 DAYS="${2:?Usage: discover-sessions.sh <repo-name> <days> [--cwd /abs/repo/root] [--platform claude|codex|cursor|pi|omp]}"
 PLATFORM="all"
 REPO_CWD=""
+SESSION_ROOT=""
 
 # Parse optional --platform flag
 shift 2
 while [ $# -gt 0 ]; do
     case "$1" in
         --cwd) REPO_CWD="$2"; shift 2 ;;
+        --session-root) SESSION_ROOT="$2"; shift 2 ;;
         --platform) PLATFORM="$2"; shift 2 ;;
         *) shift ;;
     esac
@@ -47,7 +49,7 @@ encode_pi_cwd() {
 discover_claude() {
     local base="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
     [ -d "$base" ] || return 0
-    find "$base" -mindepth 2 -maxdepth 2 -type f -name "*.jsonl" -mtime "-${DAYS}" 2>/dev/null
+    find "$base" -mindepth 2 -type f -name "*.jsonl" -mtime "-${DAYS}" 2>/dev/null
 }
 
 # --- Codex ---
@@ -241,6 +243,15 @@ discover_omp() {
     # The probe and the globs can hit the same bucket; emit each path once.
     } | awk '!seen[$0]++'
 }
+
+# An explicit root is path discovery only; recorded cwd still requires admission.
+if [ -n "$SESSION_ROOT" ]; then
+    case "$SESSION_ROOT" in /*) ;; *) echo "session root must be absolute" >&2; exit 2 ;; esac
+    case "$PLATFORM" in claude|codex) ;; *) echo "session root requires claude or codex platform" >&2; exit 2 ;; esac
+    [ -d "$SESSION_ROOT" ] || { echo "session root missing" >&2; exit 2; }
+    find "$SESSION_ROOT" -type f -name "*.jsonl" -mtime "-${DAYS}"
+    exit 0
+fi
 
 # --- Dispatch ---
 case "$PLATFORM" in

@@ -35,7 +35,12 @@ parser.add_argument(
     metavar="PATH",
     help="Write extracted skeleton to PATH instead of stdout. Stdout receives a one-line _meta status.",
 )
+parser.add_argument("--json", action="store_true", help="Emit one JSON object with text and meta.")
 args = parser.parse_args()
+if args.json and args.output:
+    parser.error("--json and --output are mutually exclusive")
+import runpy
+shared = runpy.run_path(os.path.join(os.path.dirname(__file__), "extract-metadata.py"))
 
 # Session logs are UTF-8; force UTF-8 I/O so Windows' cp1252 default can't crash
 # on non-Latin-1 content like emoji, smart quotes, or box-drawing (#1258).
@@ -46,7 +51,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 # go to the buffer; at the end the buffer is written to PATH and a status
 # line is emitted to the real stdout.
 _original_stdout = sys.stdout
-if args.output:
+if args.output or args.json:
     sys.stdout = io.StringIO()
 
 stats = {"lines": 0, "parse_errors": 0, "user": 0, "assistant": 0, "tool": 0, "summary": 0}
@@ -187,13 +192,13 @@ def handle_claude(obj):
             texts = [
                 c.get("text", "")
                 for c in content
-                if c.get("type") == "text" and len(c.get("text", "")) > 10
+                if c.get("type") == "text" and len(c.get("text", "")) > 0
             ]
             content = " ".join(texts)
 
         if isinstance(content, str):
             content = clean_text(content)
-            if len(content) > 15:
+            if len(content) > 0:
                 flush_tools()
                 print(f"[{ts}] [user] {content[:800]}")
                 print("---")
@@ -207,7 +212,7 @@ def handle_claude(obj):
             for block in content:
                 if block.get("type") == "text":
                     text = clean_text(block.get("text", ""))
-                    if len(text) > 20:
+                    if len(text) > 0:
                         if not has_text:
                             flush_tools()
                             has_text = True
@@ -224,53 +229,21 @@ def handle_claude(obj):
 
 
 def handle_codex(obj):
-    msg_type = obj.get("type")
     ts = obj.get("timestamp", "")[:19]
-
-    if msg_type == "event_msg":
+    if obj.get("type") == "_reader_tool":
+        pending_tools.append({"ts": ts, "name": obj["name"], "target": obj["target"][:120], "status": obj["status"]})
+    elif obj.get("type") == "response_item":
         p = obj.get("payload", {})
-        if p.get("type") == "user_message":
-            text = p.get("message", "")
-            if isinstance(text, str) and len(text) > 15:
-                parts = text.split("</system_instruction>")
-                user_text = parts[-1].strip() if parts else text
-                if len(user_text) > 15:
-                    flush_tools()
-                    print(f"[{ts}] [user] {user_text[:800]}")
-                    print("---")
-                    stats["user"] += 1
-
-        elif p.get("type") == "exec_command_end":
-            # This is the deduplicated result — has status info
-            command = p.get("command", [])
-            cmd_str = command[-1] if command else ""
-            output = p.get("aggregated_output", "")
-
-            status = "ok"
-            if "Process exited with code " in output:
-                try:
-                    code = int(output.split("Process exited with code ")[1].split("\n")[0])
-                    if code != 0:
-                        status = f"error(exit {code})"
-                except (IndexError, ValueError):
-                    pass
-
-            if cmd_str:
-                # Shorten common patterns for readability
-                short_cmd = cmd_str[:120]
-                pending_tools.append({"ts": ts, "name": "exec", "target": short_cmd, "status": status})
-
-    elif msg_type == "response_item":
-        p = obj.get("payload", {})
-        if p.get("type") == "message" and p.get("role") == "assistant":
-            for block in p.get("content", []):
-                if block.get("type") == "output_text" and len(block.get("text", "")) > 20:
-                    flush_tools()
-                    print(f"[{ts}] [assistant] {block['text'][:800]}")
-                    print("---")
-                    stats["assistant"] += 1
-
-        # Skip function_call — exec_command_end is the deduplicated version with status
+        if p.get("type") == "message" and p.get("role") in ("user", "assistant"):
+            text = shared["message_text"](p.get("content"))
+            if p.get("role") == "user":
+                text = text.split("</system_instruction>")[-1].strip()
+            if text:
+                flush_tools()
+                role = p["role"]
+                print(f"[{ts}] [{role}] {text[:800]}")
+                print("---")
+                stats[role] += 1
 
 
 def _pi_text_content(content):
@@ -554,7 +527,7 @@ for line in sys.stdin:
                 detected = "codex"
             elif obj.get("role") in ("user", "assistant") and "type" not in obj:
                 detected = "cursor"
-        except (json.JSONDecodeError, KeyError):
+        except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
             pass
 
 handlers = {"claude": handle_claude, "codex": handle_codex, "cursor": handle_cursor, "pi": handle_pi, "omp": handle_pi}
@@ -563,17 +536,23 @@ handler = handlers.get(detected, handle_codex)
 objects = []
 for line in buffer:
     try:
-        objects.append(json.loads(line))
-    except (json.JSONDecodeError, KeyError):
+        value = json.loads(line)
+        if not isinstance(value, dict):
+            raise TypeError("object required")
+        objects.append(value)
+    except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
         stats["parse_errors"] += 1
 
 if detected in ("pi", "omp"):
     objects = _pi_context_objects(objects)
 
+objects, diagnostics = shared["prepare_records"](objects, detected)
+stats.update(diagnostics)
+
 for obj in objects:
     try:
         handler(obj)
-    except KeyError:
+    except (KeyError, TypeError, AttributeError, ValueError):
         stats["parse_errors"] += 1
 
 # Flush any remaining buffered tools
@@ -588,3 +567,9 @@ if args.output:
         f.write(body)
     bytes_written = os.path.getsize(args.output)
     print(json.dumps({"_meta": True, "wrote": args.output, "bytes": bytes_written, **stats}))
+
+if args.json:
+    body = sys.stdout.getvalue()
+    sys.stdout = _original_stdout
+    text = "\n".join(body.splitlines()[:-1])
+    print(json.dumps({"text": text, "meta": {"_meta": True, **stats}}))
