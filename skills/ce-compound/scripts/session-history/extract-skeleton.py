@@ -36,7 +36,18 @@ parser.add_argument(
     help="Write extracted skeleton to PATH instead of stdout. Stdout receives a one-line _meta status.",
 )
 parser.add_argument("--json", action="store_true", help="Emit one JSON object with text and meta.")
+parser.add_argument("--start-record", help="Inclusive canonical record SHA256; requires --end-record and --json.")
+parser.add_argument("--end-record", help="Inclusive canonical record SHA256; requires --start-record and --json.")
+parser.add_argument("--boundaries-json", action="store_true", help="Emit at most 1000 body-free native boundary headers.")
 args = parser.parse_args()
+if (args.start_record is None) != (args.end_record is None):
+    parser.error("--start-record and --end-record are required together")
+if args.start_record is not None and not args.json:
+    parser.error("record selection requires --json")
+if args.boundaries_json and (args.output or args.start_record is not None):
+    parser.error("--boundaries-json cannot combine with --output or record selection")
+if args.boundaries_json:
+    args.json = True
 if args.json and args.output:
     parser.error("--json and --output are mutually exclusive")
 import runpy
@@ -546,7 +557,16 @@ for line in buffer:
 if detected in ("pi", "omp"):
     objects = _pi_context_objects(objects)
 
-objects, diagnostics = shared["prepare_records"](objects, detected)
+if args.boundaries_json:
+    boundaries, diagnostics = shared["prepare_window"](objects, detected, None, None, stats["parse_errors"], boundaries=True)
+    stats.update(diagnostics)
+    sys.stdout = _original_stdout
+    print(json.dumps({"boundaries": boundaries, "meta": {"_meta": True, **stats}}))
+    sys.exit(0)
+if args.start_record is not None:
+    objects, diagnostics = shared["prepare_window"](objects, detected, args.start_record, args.end_record, stats["parse_errors"])
+else:
+    objects, diagnostics = shared["prepare_records"](objects, detected)
 stats.update(diagnostics)
 
 for obj in objects:

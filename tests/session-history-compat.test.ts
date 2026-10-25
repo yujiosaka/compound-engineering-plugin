@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test"
+import { createHash } from "node:crypto"
 import { mkdtemp, mkdir, writeFile, rm, utimes } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -205,5 +206,195 @@ describe("native result grammar and explicit incomplete evidence", () => {
       expect(metadata.sessions[0].parent_session).toBe("parent")
       expect(metadata.sessions[0].parent_source).toBe("path")
     })
+  })
+})
+
+
+describe("trusted evidence windows in the existing reader", () => {
+  const user = (text: string, timestamp = ts) => ({ type: "response_item", timestamp, payload: { type: "message", role: "user", content: [{ type: "input_text", text }] } })
+  const claude = (type: string, content: unknown, uuid: string) => ({ type, cwd, sessionId: "claude-synthetic", timestamp: ts, uuid, message: { role: type, content } })
+  async function range(rows: unknown[], first: number, last = first) {
+    const listed = await run("extract-skeleton.py", rows, ["--boundaries-json"])
+    return ["--start-record", listed.boundaries[first].fingerprint, "--end-record", listed.boundaries[last].fingerprint]
+  }
+  test("boundary headers are canonical, bounded, body-free and cannot choose a window", async () => {
+    const record = user("PRIVATE_BODY_NEVER_A_HEADER")
+    const rows = [meta, record, call("header-id", false, {cmd: "PRIVATE_COMMAND", workdir:cwd})]
+    const out = await run("extract-skeleton.py", rows, ["--boundaries-json"])
+    expect(out.text).toBeUndefined()
+    expect(out.meta.tool_observations).toEqual([])
+    expect(JSON.stringify(out)).not.toContain("PRIVATE_BODY")
+    expect(JSON.stringify(out)).not.toContain("PRIVATE_COMMAND")
+    expect(out.boundaries[1]).toMatchObject({kind:"response_item:message",timestamp:ts,role:"user"})
+    expect(out.boundaries[2].native_id).toBe("header-id")
+    const unicode = await run("extract-skeleton.py", [meta, user("日本語")], ["--boundaries-json"])
+    const canonical = '{"payload":{"content":[{"text":"日本語","type":"input_text"}],"role":"user","type":"message"},"timestamp":"2025-01-01T00:00:00Z","type":"response_item"}'
+    expect(unicode.boundaries[1].fingerprint).toBe(createHash("sha256").update(canonical,"utf8").digest("hex"))
+    const reordered = { payload: { content: record.payload.content, role:"user", type:"message" }, timestamp:ts, type:"response_item" }
+    expect((await run("extract-skeleton.py", [meta, reordered], ["--boundaries-json"])).boundaries[1].fingerprint).toBe(out.boundaries[1].fingerprint)
+    const many = await run("extract-skeleton.py", [meta, ...Array.from({length:1001}, (_,i)=>user(String(i)))], ["--boundaries-json"])
+    expect(many.boundaries.length).toBe(1000)
+    expect(many.meta.boundaries).toEqual({total:1002,returned:1000,truncated:2})
+  })
+  test("unrelated outside text, failures and omitted images never enter selected evidence", async () => {
+    const picked = user("Use saved values")
+    const rows = [meta, picked]
+    const selection = await range(rows, 1)
+    for(const reader of ["extract-skeleton.py","extract-errors.py"]) {
+      const base = await run(reader,rows,selection)
+      const extended = await run(reader,[meta,user("OUTSIDE_PRIVATE_".repeat(100)),picked,call("outside"),result("outside",{exit_code:1,output:"OUTSIDE_FAILURE"}),user("later"),row("response_item",{type:"message",role:"user",content:[{type:"input_image",image_url:"OUTSIDE_IMAGE"}]})],selection)
+      expect(extended.text).toBe(base.text)
+      expect(extended.meta.truncated).toBe(0)
+      expect(extended.meta.omitted).toBe(0)
+      expect(extended.meta.unknown_records).toBe(0)
+      expect(extended.meta.tool_observations).toEqual([])
+      expect(extended.meta.outside.truncated).toBeGreaterThan(0)
+      expect(extended.meta.outside.omitted).toBeGreaterThan(0)
+      expect(extended.meta.selection).toMatchObject({valid:true,range_records:1,selected_records:1,closure_records:0,outside_records:6,complete_session:false})
+      expect(JSON.stringify(extended)).not.toContain("OUTSIDE_")
+    }
+  })
+  test("selected long text and selected omitted evidence remain incomplete", async () => {
+    for(const selected of [user("long".repeat(300)),row("response_item",{type:"message",role:"user",content:[{type:"input_image"}]})]) {
+      const rows=[meta,selected], selection=await range(rows,1)
+      for(const reader of ["extract-skeleton.py","extract-errors.py"]) {
+        const out=await run(reader,rows,selection)
+        expect(out.meta.truncated+out.meta.omitted).toBeGreaterThan(0)
+      }
+    }
+  })
+  test("missing duplicate reversed and malformed boundaries refuse without text", async () => {
+    const rows=[meta,user("first"),user("last")],selection=await range(rows,1,2)
+    for(const [input,args] of [[rows,["--start-record","0".repeat(64),"--end-record",selection[3]]],[[...rows,rows[1]],selection],[rows,["--start-record",selection[3],"--end-record",selection[1]]],[rows,["--start-record","invalid","--end-record",selection[3]]],[rows,["--start-record","","--end-record",""]]] as Array<[unknown[],string[]]>) {
+      for(const reader of ["extract-skeleton.py","extract-errors.py"]) {
+        const out=await run(reader,input,args)
+        expect(out.text).toBe("")
+        expect(out.meta.selection.valid).toBe(false)
+        expect(out.meta.global.selection_errors).toBe(1)
+        expect(out.meta.unknown_records).toBeGreaterThan(0)
+      }
+    }
+  })
+  test("both boundaries are inclusive and selection closes outside calls results and aliases", async () => {
+    const alias=row("event_msg",{type:"exec_command_end",call_id:"linked",exit_code:1,cwd,command:["check synthetic"]})
+    const rows=[meta,call("linked"),user("selected correction"),result("linked",{exit_code:1}),alias]
+    for(const pair of [[1,2],[2,3],[3,3]]) {
+      const selection=await range(rows,pair[0],pair[1])
+      const skeleton=await run("extract-skeleton.py",rows,selection),errors=await run("extract-errors.py",rows,selection)
+      expect(skeleton.meta.tool).toBe(1)
+      expect(skeleton.meta.unmatched_calls+skeleton.meta.unmatched_results).toBe(0)
+      expect(skeleton.meta.selection.closure_records).toBeGreaterThan(0)
+      expect(skeleton.meta.tool_observations[0].status).toBe("error")
+      expect(errors.meta.errors_found).toBe(1)
+      expect(errors.meta.selection).toEqual(skeleton.meta.selection)
+    }
+  })
+  test("outside same-ID failure and identity disagreements can never be excluded",async()=>{
+    const rows=[meta,call("same"),result("same",{exit_code:0}),user("selected")],selection=await range(rows,1,2)
+    for(const reader of ["extract-skeleton.py","extract-errors.py"]) {
+      const out=await run(reader,[...rows,result("same",{exit_code:1})],selection)
+      expect(out.meta.global.identity_conflicts).toBeGreaterThan(0)
+      expect(out.meta.identity_conflicts).toBeGreaterThan(0)
+      expect(out.meta.tool_observations[0].status).toBe("error")
+      const unlinkedConflict=await run(reader,[...rows,call("other"),result("other",{exit_code:0}),result("other",{exit_code:1})],selection)
+      expect(unlinkedConflict.meta.global.identity_conflicts).toBeGreaterThan(0)
+      expect(unlinkedConflict.meta.identity_conflicts).toBeGreaterThan(0)
+      expect(unlinkedConflict.meta.tool_observations.length).toBe(1)
+    }
+  })
+  test("unknown grammar missing links metadata conflict and every parse error remain global",async()=>{
+    const rows=[meta,user("selected")],selection=await range(rows,1)
+    const extras=[row("response_item",{type:"future_call",output:"PRIVATE"}),call("unmatched"),row("response_item",{type:"function_call_output",output:{exit_code:0}}),{...meta,payload:{...meta.payload,cwd:"/synthetic/foreign"}}]
+    for(const reader of ["extract-skeleton.py","extract-errors.py"]) {
+      for(const extra of extras) {
+        const out=await run(reader,[...rows,extra],selection)
+        expect(out.meta.unknown_records+out.meta.unmatched_calls+out.meta.unmatched_results+out.meta.identity_conflicts).toBeGreaterThan(0)
+        expect(JSON.stringify(out)).not.toContain("PRIVATE")
+      }
+      const malformed=await run(reader,rows,selection,'{"malformed":')
+      expect(malformed.meta.global.parse_errors).toBe(1)
+      expect(malformed.meta.parse_errors).toBe(1)
+    }
+  })
+  test("Claude whole-record closure is transitive across multiple tool identities",async()=>{
+    const start=claude("user","selected correction","u1")
+    const a=claude("assistant",[{type:"tool_use",id:"a",name:"Bash",input:{command:"check",cwd}}],"a1")
+    const b=claude("user",[{type:"tool_result",tool_use_id:"a",content:"ok"},{type:"tool_use",id:"b",name:"Bash",input:{command:"next",cwd}}],"u2")
+    const c=claude("user",[{type:"tool_result",tool_use_id:"b",is_error:true,content:"failed"}],"u3")
+    const rows=[claude("assistant","OUTSIDE_".repeat(200),"outside"),start,a,b,c],selection=await range(rows,1,2)
+    for(const reader of ["extract-skeleton.py","extract-errors.py"]) {
+      const out=await run(reader,rows,selection)
+      expect(out.meta.selection).toMatchObject({range_records:2,selected_records:4,closure_records:2,outside_records:1})
+      expect(out.meta.truncated).toBe(0)
+      expect(out.meta.outside.truncated).toBe(1)
+      expect(out.meta.tool_observations.map((v:any)=>v.call_id)).toEqual(["a","b"])
+      expect(out.meta.tool_observations[1].status).toBe("error")
+      expect(JSON.stringify(out)).not.toContain("OUTSIDE_")
+    }
+  })
+  test("message aliases close by existing native identity or equal timestamp and text",async()=>{
+    const canonical=user("same native message"), alias=row("event_msg",{type:"user_message",message:"same native message"})
+    const rows=[meta,canonical,alias],selection=await range(rows,1)
+    const out=await run("extract-skeleton.py",rows,selection)
+    expect(out.meta.user).toBe(1)
+    expect(out.meta.selection.closure_records).toBe(1)
+    const different=await run("extract-skeleton.py",[meta,canonical,{...alias,timestamp:"2025-01-01T00:00:01Z"}],selection)
+    expect(different.meta.selection.closure_records).toBe(0)
+    const native=claude("user","outside","reused")
+    const selected=claude("user","selected","selected")
+    const crows=[native,selected],cselection=await range(crows,1)
+    const conflict=await run("extract-skeleton.py",[...crows,{...native,message:{role:"user",content:"changed outside"}}],cselection)
+    expect(conflict.meta.global.identity_conflicts).toBeGreaterThan(0)
+  })
+  test("unsupported platform and unknown message blocks outside cannot produce a ready window",async()=>{
+    const rows=[meta,user("selected")],selection=await range(rows,1)
+    const unknown=row("response_item",{type:"message",role:"user",content:[{type:"future_text",text:"OUTSIDE_PRIVATE"}]})
+    for(const reader of ["extract-skeleton.py","extract-errors.py"]) {
+      const out=await run(reader,[...rows,unknown],selection)
+      expect(out.meta.global.unknown_records).toBeGreaterThan(0)
+      expect(out.meta.unknown_records).toBeGreaterThan(0)
+      expect(JSON.stringify(out)).not.toContain("OUTSIDE_PRIVATE")
+      const unsupported=await run(reader,[{type:"session",id:"pi",cwd}],selection)
+      expect(unsupported.meta.unsupported).toBe(true)
+    }
+  })
+  test("exact known runtime context is omitted; unknown subtype field or container stays global",async()=>{
+    const attachment=(value:object)=>({type:"attachment",attachment:value,cwd,entrypoint:"cli",gitBranch:"synthetic",isSidechain:false,parentUuid:null,sessionId:"claude-synthetic",timestamp:ts,userType:"external",uuid:"attachment",version:"synthetic"})
+    const examples=[
+      {type:"deferred_tools_delta",addedNames:["synthetic"],addedLines:["OUTSIDE_CONTEXT"],removedNames:[],readdedNames:[],pendingMcpServers:[],needsAuthMcpServers:[]},
+      {type:"agent_listing_delta",addedTypes:["synthetic"],addedLines:["OUTSIDE_CONTEXT"],removedTypes:[],isInitial:true,showConcurrencyNote:false},
+      {type:"mcp_instructions_delta",addedNames:["synthetic"],addedBlocks:["OUTSIDE_CONTEXT"],removedNames:[]},
+      {type:"skill_listing",content:"OUTSIDE_CONTEXT",skillCount:1,isInitial:true,names:["synthetic"]},
+      {type:"date_change",newDate:"OUTSIDE_CONTEXT"},
+    ]
+    const selected=claude("user","selected","u1"),selection=await range([selected],0)
+    for(const value of examples) {
+      const rows=[attachment(value),selected]
+      for(const reader of ["extract-skeleton.py","extract-errors.py"]) {
+        const whole=await run(reader,rows)
+        expect(whole.meta.omitted).toBe(1)
+        expect(whole.meta.unknown_records).toBe(0)
+        const out=await run(reader,rows,selection)
+        expect(out.meta.omitted).toBe(0)
+        expect(out.meta.outside.omitted).toBe(1)
+        expect(out.meta.unknown_records).toBe(0)
+        expect(JSON.stringify(out)).not.toContain("OUTSIDE_CONTEXT")
+        const included=await run(reader,rows,await range(rows,0,1))
+        expect(included.meta.omitted).toBe(1)
+      }
+    }
+    for(const unknown of [attachment({type:"future_context",content:"PRIVATE"}),{...attachment(examples[0]),call_id:"hidden"},attachment({...examples[0],result:{exit_code:1}}),attachment({...examples[0],addedLines:[{type:"tool_result",tool_use_id:"hidden"}]}),attachment({...examples[0],removedNames:["unobserved-element-type"]})]) {
+      const out=await run("extract-skeleton.py",[unknown,selected],selection)
+      expect(out.meta.global.unknown_records).toBeGreaterThan(0)
+      expect(out.meta.unknown_records).toBeGreaterThan(0)
+      expect(JSON.stringify(out)).not.toContain("PRIVATE")
+    }
+  })
+  test("Claude duplicate tool results outside the range remain globally contradictory",async()=>{
+    const rows=[claude("assistant",[{type:"tool_use",id:"a",name:"Bash",input:{command:"check",cwd}}],"a1"),claude("user",[{type:"tool_result",tool_use_id:"a",is_error:false,content:"ok"}],"u1"),claude("user","selected","u2")]
+    const selection=await range(rows,2)
+    const out=await run("extract-skeleton.py",[...rows,claude("user",[{type:"tool_result",tool_use_id:"a",is_error:true,content:"failed"}],"u3")],selection)
+    expect(out.meta.global.identity_conflicts).toBeGreaterThan(0)
+    expect(out.meta.identity_conflicts).toBeGreaterThan(0)
   })
 })

@@ -29,7 +29,13 @@ parser.add_argument(
     help="Write extracted errors to PATH instead of stdout. Stdout receives a one-line _meta status.",
 )
 parser.add_argument("--json", action="store_true", help="Emit one JSON object with text and meta.")
+parser.add_argument("--start-record", help="Inclusive canonical record SHA256; requires --end-record and --json.")
+parser.add_argument("--end-record", help="Inclusive canonical record SHA256; requires --start-record and --json.")
 args = parser.parse_args()
+if (args.start_record is None) != (args.end_record is None):
+    parser.error("--start-record and --end-record are required together")
+if args.start_record is not None and not args.json:
+    parser.error("record selection requires --json")
 if args.json and args.output:
     parser.error("--json and --output are mutually exclusive")
 import runpy
@@ -241,7 +247,10 @@ for line in buffer:
 if detected in ("pi", "omp"):
     objects = _pi_context_objects(objects)
 
-objects, diagnostics = shared["prepare_records"](objects, detected)
+if args.start_record is not None:
+    objects, diagnostics = shared["prepare_window"](objects, detected, args.start_record, args.end_record, stats["parse_errors"])
+else:
+    objects, diagnostics = shared["prepare_records"](objects, detected)
 stats.update(diagnostics)
 
 for obj in objects:

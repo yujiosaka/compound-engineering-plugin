@@ -730,6 +730,34 @@ def inspect_message_content(content, platform, diagnostics):
             unknown_record(diagnostics, {"type": "message_content"})
 
 
+
+def known_context_attachment(obj):
+    """Recognized runtime context is unread evidence, not an execution result."""
+    root = {"attachment", "cwd", "entrypoint", "gitBranch", "isSidechain", "parentUuid", "sessionId", "timestamp", "type", "userType", "uuid", "version"}
+    if set(obj) != root or not isinstance(obj.get("isSidechain"), bool):
+        return False
+    if any(not isinstance(obj[key], str) for key in root - {"attachment", "isSidechain", "parentUuid"}):
+        return False
+    if obj["parentUuid"] is not None and not isinstance(obj["parentUuid"], str):
+        return False
+    shapes = {
+        "deferred_tools_delta": {"addedNames": "strings", "addedLines": "strings", "removedNames": "empty", "readdedNames": "empty", "pendingMcpServers": "empty", "needsAuthMcpServers": "empty"},
+        "agent_listing_delta": {"addedTypes": "strings", "addedLines": "strings", "removedTypes": "empty", "isInitial": "bool", "showConcurrencyNote": "bool"},
+        "mcp_instructions_delta": {"addedNames": "strings", "addedBlocks": "strings", "removedNames": "empty"},
+        "skill_listing": {"content": "str", "skillCount": "count", "isInitial": "bool", "names": "strings"},
+        "date_change": {"newDate": "str"},
+    }
+    value = obj.get("attachment")
+    shape = shapes.get(value.get("type")) if isinstance(value, dict) and isinstance(value.get("type"), str) else None
+    if shape is None or set(value) != set(shape) | {"type"}:
+        return False
+    checks = {"str": lambda v: isinstance(v, str), "bool": lambda v: isinstance(v, bool),
+              "count": lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0,
+              "strings": lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v),
+              "empty": lambda v: isinstance(v, list) and not v}
+    return all(checks[kind](value[key]) for key, kind in shape.items())
+
+
 def prepare_records(objects, platform):
     diagnostics = dict(platform=platform, unsupported=platform not in ("claude", "codex", "pi", "omp"), unknown_records=0,
                        omitted=0, truncated=0, identity_conflicts=0, unmatched_calls=0, unmatched_results=0,
@@ -776,7 +804,9 @@ def prepare_records(objects, platform):
     elif platform == "claude":
         known = {"user", "assistant", "system", "progress", "file-history-snapshot", "queue-operation", "summary", "last-prompt", "custom-title", "agent-name", "agent-color", "pr-link", "saved_hook_context", "bridge_status"}
         for obj in objects:
-            if obj.get("type") not in known:
+            if obj.get("type") == "attachment" and known_context_attachment(obj):
+                diagnostics["omitted"] += 1
+            elif obj.get("type") not in known:
                 unknown_record(diagnostics, obj)
         calls = {}
         for obj in objects:
@@ -829,6 +859,172 @@ def prepare_records(objects, platform):
                         elif isinstance(block, dict) and block.get("type") == "tool_result":
                             diagnostics["truncated"] += int(len(str(block.get("content", ""))) > 200)
     return objects, diagnostics
+
+
+
+def record_fingerprint(obj):
+    """The selector names parsed content, independently of JSON whitespace/key order."""
+    return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def record_links(obj, platform):
+    """Only native identities close a range; no body/relevance heuristics."""
+    links, missing = set(), 0
+    def link(kind, value, required=False):
+        nonlocal missing
+        if isinstance(value, str) and value:
+            links.add((kind, value))
+        elif required or value is not None:
+            missing += 1
+    if platform == "codex":
+        normalized = completed_item(obj)
+        p = normalized.get("payload", {})
+        if not isinstance(p, dict):
+            return links, 1
+        kind = p.get("type")
+        if kind in ("function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output", "exec_command_begin", "exec_command_end", "exec_command_output_delta"):
+            link("tool", p.get("call_id"), True)
+        if kind == "message":
+            link("message", p.get("id"))
+            if obj.get("timestamp") and p.get("role") in ("user", "assistant"):
+                link("message-alias", json.dumps([p["role"], obj["timestamp"], message_text(p.get("content"))]))
+        elif kind in ("user_message", "agent_message") and obj.get("timestamp"):
+            link("message-alias", json.dumps(["user" if kind == "user_message" else "assistant", obj["timestamp"], p.get("message")]))
+        elif kind == "item_completed":
+            item = p.get("item", {})
+            if isinstance(item, dict) and item.get("type") == "AgentMessage":
+                link("message", item.get("id"))
+                content = item.get("content", item.get("text"))
+                if isinstance(content, list):
+                    content = [{**b, "type": "output_text"} if isinstance(b, dict) and b.get("type") == "Text" else b for b in content]
+                if obj.get("timestamp"):
+                    link("message-alias", json.dumps(["assistant", obj["timestamp"], message_text(content)]))
+    elif platform == "claude":
+        link("record", obj.get("uuid"))
+        msg = obj.get("message", {})
+        if isinstance(msg, dict):
+            content = msg.get("content", [])
+            for block in content if isinstance(content, list) else []:
+                if isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result"):
+                    link("tool", block.get("id" if block["type"] == "tool_use" else "tool_use_id"), True)
+    return links, missing
+
+
+def boundary_headers(objects):
+    import re
+    def identifier(value, limit=256):
+        return value if isinstance(value, str) and len(value) <= limit and re.fullmatch(r"[A-Za-z0-9_.:-]+", value) else None
+    rows = []
+    for obj in objects[:1000]:
+        p = obj.get("payload") if isinstance(obj.get("payload"), dict) else obj.get("message", {})
+        p = p if isinstance(p, dict) else {}
+        kind = identifier(obj.get("type"), 64) or "unknown"
+        if obj.get("type") in ("response_item", "event_msg"):
+            kind += ":" + (identifier(p.get("type"), 64) or "unknown")
+        timestamp = obj.get("timestamp")
+        timestamp = timestamp if isinstance(timestamp, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}T[0-9:.+-]{8,30}Z?", timestamp) else None
+        row = {"fingerprint": record_fingerprint(obj), "kind": kind, "timestamp": timestamp}
+        item = p.get("item") if isinstance(p.get("item"), dict) else {}
+        native_id = identifier(obj.get("uuid") or p.get("call_id") or p.get("id") or item.get("id"))
+        role = p.get("role", obj.get("type"))
+        if native_id:
+            row["native_id"] = native_id
+        if role in ("user", "assistant", "system", "developer"):
+            row["role"] = role
+        rows.append(row)
+    return rows
+
+
+def prepare_window(objects, platform, start, end, parse_errors=0, boundaries=False):
+    """Keep global uncertainty; exclude only records proven outside a native ID closure."""
+    import re
+    _, whole = prepare_records(objects, platform)
+    identities = reader_metadata([json.dumps(obj) for obj in objects])
+    links, unknown_links = [], 0
+    for obj in objects:
+        keys, missing = record_links(obj, platform)
+        links.append(keys)
+        unknown_links += missing
+    # Claude's sequential renderer cannot reconcile repeated tool IDs itself.
+    # Compare every same-ID fact before a selected window can hide a disagreement.
+    facts = {}
+    if platform == "claude":
+        for obj in objects:
+            msg = obj.get("message", {})
+            content = msg.get("content", []) if isinstance(msg, dict) else []
+            for block in content if isinstance(content, list) else []:
+                if isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result"):
+                    key = (block["type"], block.get("id" if block["type"] == "tool_use" else "tool_use_id"))
+                    if isinstance(key[1], str):
+                        facts.setdefault(key, set()).add(record_fingerprint(block))
+    # Reusing a native record/message identity for different content is global,
+    # even when every conflicting copy lies outside the requested range.
+    for obj in objects:
+        p = obj.get("payload", {})
+        native_id = obj.get("uuid") if platform == "claude" else p.get("id") if isinstance(p, dict) and p.get("type") == "message" else None
+        if isinstance(native_id, str) and native_id:
+            facts.setdefault(("record", native_id), set()).add(json.dumps(obj, sort_keys=True, separators=(",", ":")))
+    conflicts = sum(len(values) > 1 for values in facts.values())
+    global_diag = {key: whole[key] for key in ("unsupported", "identity_conflicts", "unknown_records", "unmatched_calls", "unmatched_results")}
+    global_diag["unsupported"] = platform not in ("claude", "codex")
+    global_diag["identity_conflicts"] += conflicts
+    global_diag.update(parse_errors=parse_errors + identities["parse_errors"], unknown_links=unknown_links, selection_errors=0, metadata_missing=identities["metadata_missing"])
+    fingerprints = []
+    for obj in objects:
+        try:
+            fingerprints.append(record_fingerprint(obj))
+        except (ValueError, UnicodeError):
+            fingerprints.append(None)
+            global_diag["parse_errors"] += 1
+    if boundaries:
+        meta = {**whole, "parse_errors": global_diag["parse_errors"], "global": global_diag,
+                "boundaries": {"total": len(objects), "returned": min(1000, len(objects)), "truncated": max(0, len(objects) - 1000)}}
+        meta["tool_observations"] = []
+        valid_objects = [obj for obj, fp in zip(objects, fingerprints) if fp is not None]
+        rows = boundary_headers(valid_objects)
+        meta["boundaries"]["returned"] = len(rows)
+        return rows, meta
+    reason, selected, range_count = None, set(), 0
+    if not all(isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) for value in (start, end)):
+        reason = "invalid-fingerprint"
+    elif fingerprints.count(start) != 1 or fingerprints.count(end) != 1:
+        reason = "boundary-not-unique"
+    else:
+        first, last = fingerprints.index(start), fingerprints.index(end)
+        if first > last:
+            reason = "boundary-order"
+        else:
+            selected = set(range(first, last + 1))
+            range_count = len(selected)
+    if reason:
+        global_diag["selection_errors"] += 1
+    # Transitive closure operates on whole records, including multiple calls in one message.
+    by_link = {}
+    for i, keys in enumerate(links):
+        for key in keys:
+            by_link.setdefault(key, set()).add(i)
+    pending = list(selected)
+    while pending:
+        i = pending.pop()
+        for key in links[i]:
+            for other in by_link[key] - selected:
+                selected.add(other)
+                pending.append(other)
+    chosen, diag = prepare_records([obj for i, obj in enumerate(objects) if i in selected], platform)
+    _, outside = prepare_records([obj for i, obj in enumerate(objects) if i not in selected], platform)
+    outside.pop("tool_observations", None)
+    outside["parse_errors"] = 0  # Parse failures cannot be located outside a window.
+    diag["unsupported"] = global_diag["unsupported"]
+    for key in ("identity_conflicts", "unknown_records", "unmatched_calls", "unmatched_results"):
+        diag[key] = max(diag[key], global_diag[key])
+    diag["unknown_records"] += unknown_links + global_diag["selection_errors"] + int(global_diag["metadata_missing"])
+    diag["parse_errors"] = global_diag["parse_errors"]
+    diag["global"] = global_diag
+    diag["outside"] = outside
+    diag["selection"] = {"mode": "window", "start_record": start, "end_record": end, "valid": reason is None, "reason": reason,
+                         "total_records": len(objects), "range_records": range_count, "selected_records": len(selected),
+                         "closure_records": len(selected) - range_count, "outside_records": len(objects) - len(selected), "complete_session": False}
+    return chosen, diag
 
 
 def main():
