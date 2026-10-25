@@ -758,11 +758,33 @@ def known_context_attachment(obj):
     return all(checks[kind](value[key]) for key, kind in shape.items())
 
 
+
+def full_identity(objects):
+    """The full parsed census supplements, and never enlarges, metadata sampling."""
+    metadata = reader_metadata([json.dumps(obj) for obj in objects])
+    identity = dict(metadata["identities"])
+    child = bool(identity["parent_session"])
+    invalid = metadata["metadata_missing"] or bool(metadata["parse_errors"])
+    for key in ("cwd", "session", "parent_session", "cli_version"):
+        invalid = invalid or any(not isinstance(value, str) or not value for value in identity[key])
+    for source in identity["source"]:
+        invalid = invalid or not isinstance(source, (str, dict))
+        child = child or source == "subagent" or (isinstance(source, dict) and "subagent" in source)
+    for obj in objects:
+        if "isSidechain" in obj:
+            invalid = invalid or not isinstance(obj["isSidechain"], bool)
+            child = child or obj["isSidechain"] is True
+    identity.update(child_context=child, metadata_missing=metadata["metadata_missing"],
+                    invalid=bool(invalid or (child and not identity["parent_session"])))
+    return identity
+
+
 def prepare_records(objects, platform):
     diagnostics = dict(platform=platform, unsupported=platform not in ("claude", "codex", "pi", "omp"), unknown_records=0,
                        omitted=0, truncated=0, identity_conflicts=0, unmatched_calls=0, unmatched_results=0,
                        unknown_results=0, tool_observations=[], unknown_record_types={})
     diagnostics["identity_conflicts"] += reader_metadata([json.dumps(obj) for obj in objects])["identity_conflicts"]
+    diagnostics["full_identity"] = full_identity(objects)
     for obj in objects:
         p = obj.get("payload") if platform == "codex" else obj.get("message")
         is_message = (platform == "codex" and obj.get("type") == "response_item" and isinstance(p, dict) and p.get("type") == "message") or (platform == "claude" and obj.get("type") in ("user", "assistant"))
@@ -940,7 +962,7 @@ def prepare_window(objects, platform, start, end, parse_errors=0, boundaries=Fal
     import re
     _, whole = prepare_records(objects, platform)
     identities = reader_metadata([json.dumps(obj) for obj in objects])
-    links, unknown_links = [], 0
+    links, unknown_links = [], int(whole["full_identity"]["invalid"])
     for obj in objects:
         keys, missing = record_links(obj, platform)
         links.append(keys)
@@ -1013,6 +1035,8 @@ def prepare_window(objects, platform, start, end, parse_errors=0, boundaries=Fal
     chosen, diag = prepare_records([obj for i, obj in enumerate(objects) if i in selected], platform)
     _, outside = prepare_records([obj for i, obj in enumerate(objects) if i not in selected], platform)
     outside.pop("tool_observations", None)
+    outside.pop("full_identity", None)
+    diag["full_identity"] = whole["full_identity"]
     outside["parse_errors"] = 0  # Parse failures cannot be located outside a window.
     diag["unsupported"] = global_diag["unsupported"]
     for key in ("identity_conflicts", "unknown_records", "unmatched_calls", "unmatched_results"):

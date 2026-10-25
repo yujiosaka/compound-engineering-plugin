@@ -390,6 +390,66 @@ describe("trusted evidence windows in the existing reader", () => {
       expect(JSON.stringify(out)).not.toContain("PRIVATE")
     }
   })
+  test("whole window and boundaries retain the same full identity beyond the metadata sample",async()=>{
+    await owned(async root=>{
+      const first=claude("user","header","header")
+      const selected=claude("user","selected","selected")
+      const prefix=[first,...Array.from({length:24},(_,i)=>({type:"system",timestamp:ts,uuid:"system-"+i}))]
+      for(const late of [{parentSessionId:"late-parent"},{source:"late-source"},{version:"late-version"},{source:{subagent:{thread_spawn:{parent_thread_id:"late-parent"}}}}]) {
+        const rows=[...prefix,{type:"system",cwd,sessionId:"claude-synthetic",timestamp:ts,...late},selected]
+        const file=join(root,"late.jsonl");await writeFile(file,jsonl(rows))
+        const sampled=(await run("extract-metadata.py",[],[file])).sessions[0]
+        expect(sampled.identities.parent_session).toEqual([])
+        expect(sampled.identities.source).toEqual([])
+        expect(sampled.identities.cli_version).toEqual([])
+        const boundaries=await run("extract-skeleton.py",rows,["--boundaries-json"])
+        const selection=["--start-record",boundaries.boundaries[26].fingerprint,"--end-record",boundaries.boundaries[26].fingerprint]
+        for(const reader of ["extract-skeleton.py","extract-errors.py"]) {
+          const whole=await run(reader,rows),window=await run(reader,rows,selection)
+          expect(window.meta.full_identity).toEqual(whole.meta.full_identity)
+          expect(window.meta.full_identity).toEqual(boundaries.meta.full_identity)
+          expect(window.meta.full_identity.cwd).toEqual([cwd])
+          expect(window.meta.full_identity.session).toEqual(["claude-synthetic"])
+          expect(window.meta.full_identity.metadata_missing).toBe(false)
+          if("parentSessionId" in late||typeof late.source==="object") {
+            expect(window.meta.full_identity.parent_session).toEqual(["late-parent"])
+            expect(window.meta.full_identity.child_context).toBe(true)
+          }
+          if("source" in late)expect(window.meta.full_identity.source).toEqual([late.source])
+          if("version" in late)expect(window.meta.full_identity.cli_version).toEqual([late.version])
+          expect(window.meta.outside.full_identity).toBeUndefined()
+        }
+      }
+    })
+  })
+  test("native child context without a parent is unresolved in whole and selected modes",async()=>{
+    for(const extra of [{isSidechain:true},{source:{subagent:{thread_spawn:{}}}},{source:"subagent"},{isSidechain:"unknown"},{version:7}]) {
+      const selected={...claude("user","selected","selected"),...extra}
+      const rows=[selected],selection=await range(rows,0)
+      for(const reader of ["extract-skeleton.py","extract-errors.py"]) {
+        for(const args of [[],selection]) {
+          const out=await run(reader,rows,args)
+          expect(out.meta.full_identity.parent_session).toEqual([])
+          expect(out.meta.full_identity.invalid).toBe(true)
+          expect(out.meta.unknown_records).toBeGreaterThan(0)
+          if(args.length)expect(out.meta.global.unknown_links).toBeGreaterThan(0)
+        }
+      }
+    }
+  })
+  test("late conflicting session cwd source and version remain global rather than overwrite",async()=>{
+    const selected=user("selected"),rows=[meta,selected],selection=await range(rows,1)
+    for(const changed of [{id:"different-session"},{cwd:"/synthetic/foreign"},{source:"different-source"},{cli_version:"different-version"}]) {
+      const later={...meta,payload:{...meta.payload,...changed}}
+      for(const reader of ["extract-skeleton.py","extract-errors.py"]) {
+        const out=await run(reader,[...rows,later],selection)
+        expect(out.meta.identity_conflicts).toBeGreaterThan(0)
+        expect(out.meta.global.identity_conflicts).toBeGreaterThan(0)
+        const key="id" in changed?"session":Object.keys(changed)[0]
+        expect(out.meta.full_identity[key].length).toBe(2)
+      }
+    }
+  })
   test("Claude duplicate tool results outside the range remain globally contradictory",async()=>{
     const rows=[claude("assistant",[{type:"tool_use",id:"a",name:"Bash",input:{command:"check",cwd}}],"a1"),claude("user",[{type:"tool_result",tool_use_id:"a",is_error:false,content:"ok"}],"u1"),claude("user","selected","u2")]
     const selection=await range(rows,2)

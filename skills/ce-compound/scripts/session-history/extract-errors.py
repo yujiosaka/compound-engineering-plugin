@@ -251,6 +251,8 @@ if args.start_record is not None:
     objects, diagnostics = shared["prepare_window"](objects, detected, args.start_record, args.end_record, stats["parse_errors"])
 else:
     objects, diagnostics = shared["prepare_records"](objects, detected)
+    if detected in ("claude", "codex") and diagnostics["full_identity"]["invalid"]:
+        diagnostics["unknown_records"] += 1
 stats.update(diagnostics)
 
 for obj in objects:
