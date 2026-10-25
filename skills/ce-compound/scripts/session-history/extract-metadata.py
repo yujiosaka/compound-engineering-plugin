@@ -572,7 +572,7 @@ def tool_facts(payload):
     if isinstance(command, list):
         command = command[-1] if command else None
     facts = {"codes": sorted(set(codes)), "flags": sorted(set(flags)), "omitted": omitted + legacy_omitted}
-    for key, value in (("command", command), ("cwd", payload.get("cwd")), ("output", payload.get("output")), ("aggregated_output", payload.get("aggregated_output")), ("stderr", payload.get("stderr")), ("native_status", payload.get("native_status"))):
+    for key, value in (("name", payload.get("name")), ("command", command), ("cwd", payload.get("cwd")), ("output", payload.get("output")), ("aggregated_output", payload.get("aggregated_output")), ("stderr", payload.get("stderr")), ("native_status", payload.get("native_status"))):
         if value is not None and (value != "" or key in ("output", "aggregated_output", "stderr")):
             if isinstance(value, str):
                 try:
@@ -649,7 +649,7 @@ def codex_records(objects, diagnostics):
             facts = [tool_facts(value) for value in group]
             # A disagreement on any mutually observed fact makes the identity unsafe.
             # Compare all results, rather than replacing an earlier alias with a later one.
-            for key in ("codes", "flags", "status", "command", "cwd", "output", "aggregated_output", "stderr", "native_status"):
+            for key in ("codes", "flags", "status", "name", "command", "cwd", "output", "aggregated_output", "stderr", "native_status"):
                 values = {json.dumps(f[key], sort_keys=True) for f in facts if key in f and not (key in ("codes", "flags") and not f[key]) and not (key == "status" and f[key] == "unknown")}
                 if len(values) > 1:
                     diagnostics["identity_conflicts"] += 1

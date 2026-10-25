@@ -93,7 +93,7 @@ describe("native result grammar and explicit incomplete evidence", () => {
         expect((await run("extract-errors.py", rows)).meta.errors_found).toBe(1)
       }
     }
-    for (const changed of [{ command: "different synthetic command" }, { result: { isError: false, content: "different result" } }, { result: [] }, { result: "" }, { cwd: "/synthetic/other" }]) {
+    for (const changed of [{ tool: "DifferentTool" }, { command: "different synthetic command" }, { result: { isError: false, content: "different result" } }, { result: [] }, { result: "" }, { cwd: "/synthetic/other" }]) {
       const out = await run("extract-skeleton.py", [meta, call("same"), result("same", { exit_code: 0 }), native({ status: "completed", exit_code: 0, result: { isError: false, content: "first result" } }), native({ status: "completed", exit_code: 0, result: { isError: false, content: "first result" }, ...changed })])
       expect(out.meta.identity_conflicts).toBeGreaterThan(0)
     }
