@@ -450,6 +450,26 @@ describe("trusted evidence windows in the existing reader", () => {
       }
     }
   })
+  test("explicit empty identity and competing aliases cannot disappear from the census",async()=>{
+    const selected=claude("user","selected","selected"),selection=await range([selected],0)
+    for(const changed of [{cwd:null},{sessionId:""},{source:null},{version:null},{parentSessionId:""}]) {
+      for(const reader of ["extract-skeleton.py","extract-errors.py"]) {
+        const rows=[selected,{type:"system",...changed}]
+        for(const args of [[],selection]) {
+          const out=await run(reader,rows,args)
+          expect(out.meta.full_identity.invalid).toBe(true)
+          expect(out.meta.unknown_records).toBeGreaterThan(0)
+        }
+      }
+    }
+    const root=await run("extract-skeleton.py",[{...selected,isSidechain:false,parentUuid:null,parentSessionId:null}])
+    expect(root.meta.full_identity.invalid).toBe(false)
+    expect(root.meta.full_identity.child_context).toBe(false)
+    for(const fields of [{sessionId:"second-session"},{parentSessionId:"one",parent_session_id:"two"},{version:"other-version"}]) {
+      const out=await run("extract-skeleton.py",[{...meta,payload:{...meta.payload,...fields}},user("selected")])
+      expect(out.meta.identity_conflicts).toBeGreaterThan(0)
+    }
+  })
   test("Claude duplicate tool results outside the range remain globally contradictory",async()=>{
     const rows=[claude("assistant",[{type:"tool_use",id:"a",name:"Bash",input:{command:"check",cwd}}],"a1"),claude("user",[{type:"tool_result",tool_use_id:"a",is_error:false,content:"ok"}],"u1"),claude("user","selected","u2")]
     const selection=await range(rows,2)

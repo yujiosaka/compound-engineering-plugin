@@ -763,19 +763,49 @@ def full_identity(objects):
     """The full parsed census supplements, and never enlarges, metadata sampling."""
     metadata = reader_metadata([json.dumps(obj) for obj in objects])
     identity = dict(metadata["identities"])
-    child = bool(identity["parent_session"])
-    invalid = metadata["metadata_missing"] or bool(metadata["parse_errors"])
-    for key in ("cwd", "session", "parent_session", "cli_version"):
-        invalid = invalid or any(not isinstance(value, str) or not value for value in identity[key])
-    for source in identity["source"]:
-        invalid = invalid or not isinstance(source, (str, dict))
-        child = child or source == "subagent" or (isinstance(source, dict) and "subagent" in source)
+    child, invalid = False, bool(metadata["parse_errors"])
     for obj in objects:
+        p = obj.get("payload", {}) if obj.get("type") in ("session_meta", "turn_context") else obj
+        if not isinstance(p, dict):
+            invalid = True
+            continue
+        # Inspect every alias, including explicit empty values; precedence must
+        # not hide another supplied session, parent or version identity.
+        fields = [("cwd", "cwd"), ("sessionId", "session"), ("parent_session_id", "parent_session"),
+                  ("parentSessionId", "parent_session"), ("cli_version", "cli_version"), ("version", "cli_version")]
+        if obj.get("type") == "session_meta":
+            fields.append(("id", "session"))
+        for field, key in fields:
+            if field not in p:
+                continue
+            value = p[field]
+            if key == "parent_session" and value is None:
+                continue  # Native optional parent absence is not a malformed ID.
+            if not isinstance(value, str) or not value:
+                invalid = True
+            elif value not in identity[key]:
+                identity[key].append(value)
+        if "source" in p:
+            source = p["source"]
+            invalid = invalid or not isinstance(source, (str, dict)) or not source
+            child = child or source == "subagent" or (isinstance(source, dict) and "subagent" in source)
+            if isinstance(source, dict):
+                invalid = invalid or set(source) != {"subagent"}
+                subagent = source.get("subagent")
+                spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+                if isinstance(spawn, dict) and "parent_thread_id" in spawn:
+                    value = spawn["parent_thread_id"]
+                    if not isinstance(value, str) or not value:
+                        invalid = True
+                    elif value not in identity["parent_session"]:
+                        identity["parent_session"].append(value)
         if "isSidechain" in obj:
             invalid = invalid or not isinstance(obj["isSidechain"], bool)
             child = child or obj["isSidechain"] is True
-    identity.update(child_context=child, metadata_missing=metadata["metadata_missing"],
-                    invalid=bool(invalid or (child and not identity["parent_session"])))
+    missing = any(not identity[key] for key in ("cwd", "session"))
+    child = child or bool(identity["parent_session"])
+    identity.update(child_context=child, metadata_missing=missing,
+                    invalid=bool(invalid or missing or (child and not identity["parent_session"])))
     return identity
 
 
@@ -783,8 +813,8 @@ def prepare_records(objects, platform):
     diagnostics = dict(platform=platform, unsupported=platform not in ("claude", "codex", "pi", "omp"), unknown_records=0,
                        omitted=0, truncated=0, identity_conflicts=0, unmatched_calls=0, unmatched_results=0,
                        unknown_results=0, tool_observations=[], unknown_record_types={})
-    diagnostics["identity_conflicts"] += reader_metadata([json.dumps(obj) for obj in objects])["identity_conflicts"]
     diagnostics["full_identity"] = full_identity(objects)
+    diagnostics["identity_conflicts"] += sum(len(diagnostics["full_identity"][key]) > 1 for key in ("cwd", "session", "parent_session", "source", "cli_version"))
     for obj in objects:
         p = obj.get("payload") if platform == "codex" else obj.get("message")
         is_message = (platform == "codex" and obj.get("type") == "response_item" and isinstance(p, dict) and p.get("type") == "message") or (platform == "claude" and obj.get("type") in ("user", "assistant"))
