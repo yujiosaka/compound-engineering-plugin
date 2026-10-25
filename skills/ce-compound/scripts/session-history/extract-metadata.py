@@ -754,14 +754,22 @@ def prepare_records(objects, platform):
             p = obj.get("payload", {})
             if obj.get("type") == "event_msg" and isinstance(p, dict) and p.get("type") == "item_completed":
                 item = p.get("item", {})
-                if not isinstance(item, dict) or item.get("type") not in ("Reasoning", "AgentMessage", "SubAgentActivity", "CommandExecution", "McpToolCall", "FileChange"):
+                if not isinstance(item, dict) or item.get("type") not in ("Reasoning", "AgentMessage", "SubAgentActivity", "CommandExecution", "McpToolCall", "FileChange", "ContextCompaction"):
                     unknown_record(diagnostics, obj)
                 elif item.get("type") in ("CommandExecution", "McpToolCall", "FileChange") and item.get("status") not in ("completed", "failed"):
                     unknown_record(diagnostics, obj)
+                elif item.get("type") == "ContextCompaction":
+                    diagnostics["omitted"] += 1
                 elif item.get("type") == "AgentMessage":
-                    inspect_message_content(item.get("content"), platform, diagnostics)
-                    text = message_text(item.get("content"))
-                    matched = any(text and text == message_text(message["payload"].get("content")) and ((item.get("id") and item["id"] == message["payload"].get("id")) or (obj.get("timestamp") and obj["timestamp"] == message.get("timestamp"))) for message in canonical_messages)
+                    contents = [item[key] for key in ("content", "text") if key in item] or [None]
+                    texts = []
+                    for content in contents:
+                        if isinstance(content, list):
+                            content = [{**block, "type": "output_text"} if isinstance(block, dict) and block.get("type") == "Text" else block for block in content]
+                        inspect_message_content(content, platform, diagnostics)
+                        texts.append(message_text(content))
+                    diagnostics["identity_conflicts"] += int(len(set(texts)) > 1)
+                    matched = all(any(text and text == message_text(message["payload"].get("content")) and ((item.get("id") and item["id"] == message["payload"].get("id")) or (obj.get("timestamp") and obj["timestamp"] == message.get("timestamp"))) for message in canonical_messages) for text in texts)
                     if not matched:
                         diagnostics["omitted"] += 1
         objects = codex_records(objects, diagnostics)
