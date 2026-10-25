@@ -550,9 +550,12 @@ def completed_item(obj):
     if not isinstance(item, dict) or item.get("type") not in ("CommandExecution", "McpToolCall", "FileChange"):
         return obj
     result = {"type": "exec_command_end", "call_id": item.get("id"), "requires_association": True,
-              "name": item.get("tool") if isinstance(item.get("tool"), str) else item["type"],
-              "cwd": item.get("cwd"), "command": item.get("command", ""),
-              "output": item.get("result"), "aggregated_output": item.get("aggregated_output", item.get("stdout", ""))}
+              "name": item.get("tool") if isinstance(item.get("tool"), str) else item["type"]}
+    for source, target in (("status", "native_status"), ("cwd", "cwd"), ("command", "command"), ("result", "output"), ("stderr", "stderr")):
+        if source in item:
+            result[target] = item[source]
+    if "aggregated_output" in item or "stdout" in item:
+        result["aggregated_output"] = item.get("aggregated_output", item.get("stdout"))
     if "exit_code" in item:
         result["exit_code"] = item["exit_code"]
     if item.get("status") == "failed":
@@ -560,18 +563,37 @@ def completed_item(obj):
     return {**obj, "payload": result}
 
 
+def tool_facts(payload):
+    """Comparable observations; missing fields never erase an observed fact."""
+    codes, flags, omitted = result_evidence(payload)
+    legacy, _, legacy_omitted = result_evidence(payload.get("aggregated_output", ""))
+    codes.extend(legacy)
+    command = payload.get("command")
+    if isinstance(command, list):
+        command = command[-1] if command else None
+    facts = {"codes": sorted(set(codes)), "flags": sorted(set(flags)), "omitted": omitted + legacy_omitted}
+    for key, value in (("command", command), ("cwd", payload.get("cwd")), ("output", payload.get("output")), ("aggregated_output", payload.get("aggregated_output")), ("stderr", payload.get("stderr")), ("native_status", payload.get("native_status"))):
+        if value is not None and (value != "" or key in ("output", "aggregated_output", "stderr")):
+            if isinstance(value, str):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    pass
+            facts[key] = value
+    facts["status"] = "error" if any(c != 0 for c in codes) or True in flags else ("ok" if codes or flags else "unknown")
+    return facts
+
+
 def codex_records(objects, diagnostics):
-    """Join native call IDs; aliases are removed only when their identity is proven."""
+    """Join native call IDs, retaining every result until all evidence is reconciled."""
     objects = [completed_item(obj) for obj in objects]
     calls, results, messages, normalized, aliases = {}, {}, {}, [], {}
     for obj in objects:
         p = obj.get("payload", {})
         if not isinstance(p, dict):
             continue
-        kind = p.get("type")
-        identity = p.get("call_id")
-        if not isinstance(identity, str):
-            identity = None
+        kind, identity = p.get("type"), p.get("call_id")
+        identity = identity if isinstance(identity, str) and identity else None
         if obj.get("type") == "response_item" and kind in ("function_call", "custom_tool_call"):
             if not identity:
                 diagnostics["unmatched_calls"] += 1
@@ -580,20 +602,12 @@ def codex_records(objects, diagnostics):
             else:
                 calls[identity] = p
         elif obj.get("type") == "response_item" and kind in ("function_call_output", "custom_tool_call_output"):
-            if identity in results and results[identity].get("output") != p.get("output"):
-                diagnostics["identity_conflicts"] += 1
-            results[identity] = p
+            if identity:
+                results.setdefault(identity, []).append(p)
         elif obj.get("type") == "event_msg" and kind == "exec_command_end" and identity:
-            previous = aliases.get(identity)
-            if previous:
-                old_codes = result_evidence(previous)[0] + result_evidence(previous.get("aggregated_output", ""))[0]
-                new_codes = result_evidence(p)[0] + result_evidence(p.get("aggregated_output", ""))[0]
-                if (previous.get("cwd") and p.get("cwd") and previous["cwd"] != p["cwd"]) or (old_codes and new_codes and set(old_codes) != set(new_codes)):
-                    diagnostics["identity_conflicts"] += 1
-            aliases[identity] = p
+            aliases.setdefault(identity, []).append(p)
         elif obj.get("type") == "response_item" and kind == "message":
-            text = message_text(p.get("content"))
-            key = (p.get("role"), text, obj.get("timestamp"))
+            key = (p.get("role"), message_text(p.get("content")), obj.get("timestamp"))
             messages[key] = messages.get(key, 0) + 1
     emitted = set()
     for obj in objects:
@@ -602,8 +616,7 @@ def codex_records(objects, diagnostics):
             normalized.append(obj)
             continue
         kind, identity = p.get("type"), p.get("call_id")
-        if not isinstance(identity, str):
-            identity = None
+        identity = identity if isinstance(identity, str) and identity else None
         if obj.get("type") == "event_msg" and kind in ("user_message", "agent_message"):
             role = "user" if kind == "user_message" else "assistant"
             key = (role, p.get("message", ""), obj.get("timestamp"))
@@ -614,12 +627,7 @@ def codex_records(objects, diagnostics):
             continue
         is_result = obj.get("type") == "response_item" and kind in ("function_call_output", "custom_tool_call_output")
         is_alias = obj.get("type") == "event_msg" and kind == "exec_command_end"
-        if is_alias and identity and identity in results:
-            # Conflicting alias status must not disappear behind the canonical result.
-            native_codes = result_evidence(results[identity].get("output"))[0]
-            alias_codes = result_evidence(p)[0] + result_evidence(p.get("aggregated_output", ""))[0]
-            if native_codes and alias_codes and set(native_codes) != set(alias_codes):
-                diagnostics["identity_conflicts"] += 1
+        if is_alias and identity in results:
             continue
         if is_result or is_alias:
             if identity and identity in emitted:
@@ -637,35 +645,36 @@ def codex_records(objects, diagnostics):
                     arguments = {}
             if not isinstance(arguments, dict):
                 arguments = {}
+            group = results.get(identity, []) + aliases.get(identity, []) if identity else [p]
+            facts = [tool_facts(value) for value in group]
+            # A disagreement on any mutually observed fact makes the identity unsafe.
+            # Compare all results, rather than replacing an earlier alias with a later one.
+            for key in ("codes", "flags", "status", "command", "cwd", "output", "aggregated_output", "stderr", "native_status"):
+                values = {json.dumps(f[key], sort_keys=True) for f in facts if key in f and not (key in ("codes", "flags") and not f[key]) and not (key == "status" and f[key] == "unknown")}
+                if len(values) > 1:
+                    diagnostics["identity_conflicts"] += 1
             cwd_values = [arguments[k] for k in ("workdir", "cwd") if isinstance(arguments.get(k), str)]
-            alias_cwd = (p if is_alias else aliases.get(identity, {})).get("cwd")
-            if isinstance(alias_cwd, str):
-                cwd_values.append(alias_cwd)
+            cwd_values.extend(f["cwd"] for f in facts if isinstance(f.get("cwd"), str))
             if len(set(cwd_values)) > 1:
                 diagnostics["identity_conflicts"] += 1
             executed_cwd = cwd_values[0] if len(set(cwd_values)) == 1 else None
-            output = p.get("output") if is_result else p
-            codes, flags, omitted = result_evidence(output)
-            if is_result and identity in aliases:
-                alias = aliases[identity]
-                more_codes, more_flags, more_omitted = result_evidence(alias)
-                legacy_codes, _, legacy_omitted = result_evidence(alias.get("aggregated_output", ""))
-                codes.extend(more_codes + legacy_codes)
-                flags.extend(more_flags)
-                omitted += more_omitted + legacy_omitted
-            if is_alias:
-                extra, _, extra_omitted = result_evidence(p.get("aggregated_output", ""))
-                codes.extend(extra)
-                omitted += extra_omitted
-            diagnostics["omitted"] += omitted
-            status = "error" if any(c != 0 for c in codes) or True in flags else ("ok" if codes or flags else "unknown")
-            if status == "unknown":
-                diagnostics["unknown_results"] += 1
             command = arguments.get("cmd", arguments.get("command", p.get("command", "")))
             if isinstance(command, list):
                 command = command[-1] if command else ""
+            if command and any(f.get("command") and f["command"] != command for f in facts):
+                diagnostics["identity_conflicts"] += 1
+            codes = [c for f in facts for c in f["codes"]]
+            flags = [flag for f in facts for flag in f["flags"]]
+            diagnostics["omitted"] += sum(f["omitted"] for f in facts)
+            status = "error" if any(c != 0 for c in codes) or True in flags else ("ok" if codes or flags else "unknown")
+            if status == "unknown":
+                diagnostics["unknown_results"] += 1
+            # Keep an error-bearing excerpt when conflicting results share an ID.
+            selected = next((value for value, f in zip(group, facts) if f["status"] == "error"), p)
+            output = selected["output"] if selected.get("output") is not None else selected
             name = call.get("name", p.get("name", "exec") if is_alias else "unknown")
-            observation = {"call_id": identity, "name": name, "executed_cwd": executed_cwd, "status": status, "timestamp": obj.get("timestamp"), "result_digest": hashlib.sha256(json.dumps(output, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
+            evidence = sorted({json.dumps(f, sort_keys=True, separators=(",", ":")) for f in facts})
+            observation = {"call_id": identity, "name": name, "executed_cwd": executed_cwd, "status": status, "timestamp": obj.get("timestamp"), "result_digest": hashlib.sha256(json.dumps(evidence).encode()).hexdigest()}
             diagnostics["tool_observations"].append(observation)
             normalized.append({"type": "_reader_tool", "timestamp": obj.get("timestamp", ""), **observation, "target": command if isinstance(command, str) else "", "output": output, "exit_codes": codes})
         elif obj.get("type") != "response_item" or kind not in ("function_call", "custom_tool_call"):
@@ -738,6 +747,7 @@ def prepare_records(objects, platform):
         payloads = {"message", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "reasoning",
                     "user_message", "agent_message", "agent_reasoning", "token_count", "task_started", "task_complete", "turn_aborted",
                     "exec_command_begin", "exec_command_end", "exec_command_output_delta", "context_compacted", "additional_tools", "thread_settings_applied", "item_completed"}
+        canonical_messages = [obj for obj in objects if obj.get("type") == "response_item" and isinstance(obj.get("payload"), dict) and obj["payload"].get("type") == "message" and obj["payload"].get("role") == "assistant"]
         for obj in objects:
             if obj.get("type") not in known or (obj.get("type") in ("response_item", "event_msg") and (not isinstance(obj.get("payload"), dict) or obj["payload"].get("type") not in payloads)):
                 unknown_record(diagnostics, obj)
@@ -746,6 +756,14 @@ def prepare_records(objects, platform):
                 item = p.get("item", {})
                 if not isinstance(item, dict) or item.get("type") not in ("Reasoning", "AgentMessage", "SubAgentActivity", "CommandExecution", "McpToolCall", "FileChange"):
                     unknown_record(diagnostics, obj)
+                elif item.get("type") in ("CommandExecution", "McpToolCall", "FileChange") and item.get("status") not in ("completed", "failed"):
+                    unknown_record(diagnostics, obj)
+                elif item.get("type") == "AgentMessage":
+                    inspect_message_content(item.get("content"), platform, diagnostics)
+                    text = message_text(item.get("content"))
+                    matched = any(text and text == message_text(message["payload"].get("content")) and ((item.get("id") and item["id"] == message["payload"].get("id")) or (obj.get("timestamp") and obj["timestamp"] == message.get("timestamp"))) for message in canonical_messages)
+                    if not matched:
+                        diagnostics["omitted"] += 1
         objects = codex_records(objects, diagnostics)
     elif platform == "claude":
         known = {"user", "assistant", "system", "progress", "file-history-snapshot", "queue-operation", "summary", "last-prompt", "custom-title", "agent-name", "agent-color", "pr-link", "saved_hook_context", "bridge_status"}

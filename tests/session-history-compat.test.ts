@@ -59,7 +59,7 @@ describe("native result grammar and explicit incomplete evidence", () => {
     expect(out.meta.user).toBe(2)
   })
   test("native completed execution keeps cwd and failure while unknown association stays pending", async () => {
-    const completed = (id: string, code: number) => row("event_msg", { type: "item_completed", item: { type: "CommandExecution", id, cwd, exit_code: code, command: "synthetic check", aggregated_output: "synthetic output", status: code ? "failed" : "completed" } })
+    const completed = (id: string, code: number) => row("event_msg", { type: "item_completed", item: { type: "CommandExecution", id, cwd, exit_code: code, command: "check synthetic", aggregated_output: "synthetic output", status: code ? "failed" : "completed" } })
     const rows = [meta, completed("native-failed", 1), completed("native-passed", 0)]
     const out = await run("extract-skeleton.py", rows)
     expect(out.meta.tool).toBe(2)
@@ -75,9 +75,41 @@ describe("native result grammar and explicit incomplete evidence", () => {
     expect(nativeTools.meta.tool_observations.every((o: any) => o.status === "error")).toBe(true)
     const supplemental = await run("extract-skeleton.py", [meta, call("same"), result("same", "command response"), completed("same", 0)])
     expect(supplemental.meta.tool_observations[0].status).toBe("ok")
-    const metadata = await run("extract-skeleton.py", [meta, row("response_item", { type: "additional_tools", tools: [] }), row("event_msg", { type: "thread_settings_applied" }), ...["world_state", "inter_agent_communication_metadata", "token_usage_record"].map(type => row(type, {})), ...["Reasoning", "AgentMessage", "SubAgentActivity"].map(type => row("event_msg", { type: "item_completed", item: { type } }))])
+    const metadata = await run("extract-skeleton.py", [meta, row("response_item", { type: "additional_tools", tools: [] }), row("event_msg", { type: "thread_settings_applied" }), ...["world_state", "inter_agent_communication_metadata", "token_usage_record"].map(type => row(type, {})), ...["Reasoning", "SubAgentActivity"].map(type => row("event_msg", { type: "item_completed", item: { type } }))])
     expect(metadata.meta.unknown_records).toBe(0)
     expect(metadata.meta.tool).toBe(0)
+  })
+  test("all same-ID evidence is reconciled before alias dedup, independent of order", async () => {
+    const native = (facts: object) => row("event_msg", { type: "item_completed", item: { type: "CommandExecution", id: "same", cwd, command: "check synthetic", ...facts } })
+    const failed = native({ status: "failed" })
+    const passed = native({ status: "completed", exit_code: 0 })
+    for (const aliases of [[failed, passed], [passed, failed]]) {
+      for (const canonical of [[], [result("same", { exit_code: 0 })]]) {
+        const rows = [meta, call("same"), ...canonical, ...aliases]
+        const skeleton = await run("extract-skeleton.py", rows)
+        expect(skeleton.meta.tool).toBe(1)
+        expect(skeleton.meta.tool_observations[0].status).toBe("error")
+        expect(skeleton.meta.identity_conflicts).toBeGreaterThan(0)
+        expect((await run("extract-errors.py", rows)).meta.errors_found).toBe(1)
+      }
+    }
+    for (const changed of [{ command: "different synthetic command" }, { result: { isError: false, content: "different result" } }, { result: [] }, { result: "" }, { cwd: "/synthetic/other" }]) {
+      const out = await run("extract-skeleton.py", [meta, call("same"), result("same", { exit_code: 0 }), native({ status: "completed", exit_code: 0, result: { isError: false, content: "first result" } }), native({ status: "completed", exit_code: 0, result: { isError: false, content: "first result" }, ...changed })])
+      expect(out.meta.identity_conflicts).toBeGreaterThan(0)
+    }
+    const duplicateResults = await run("extract-errors.py", [meta, call("same"), result("same", { exit_code: 1 }), result("same", { exit_code: 0 })])
+    expect(duplicateResults.meta.errors_found).toBe(1)
+    expect(duplicateResults.meta.identity_conflicts).toBeGreaterThan(0)
+  })
+  test("completed AgentMessage requires a matching rendered canonical message", async () => {
+    const message = row("response_item", { type: "message", role: "assistant", content: [{ type: "output_text", text: "Synthetic repair verified" }] })
+    const completed = (content: unknown) => row("event_msg", { type: "item_completed", item: { type: "AgentMessage", content } })
+    for (const name of ["extract-skeleton.py", "extract-errors.py"]) {
+      expect((await run(name, [meta, completed("Synthetic repair verified")])).meta.omitted).toBeGreaterThan(0)
+      expect((await run(name, [meta, message, completed("Different result")])).meta.omitted).toBeGreaterThan(0)
+      expect((await run(name, [meta, message, completed("Synthetic repair verified")])).meta.omitted).toBe(0)
+      expect((await run(name, [meta, completed({ content: "Synthetic repair verified" })])).meta.unknown_records).toBeGreaterThan(0)
+    }
   })
   test("missing executed cwd never inherits session cwd; orphan IDs stay incomplete", async () => {
     const out = await run("extract-skeleton.py", [meta, call("unknown", false, { cmd: "check" }), result("unknown", { exit_code: 0 }), result("orphan", { exit_code: 0 }), call("unfinished")])
