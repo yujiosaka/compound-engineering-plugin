@@ -72,7 +72,10 @@ describe("native result grammar and explicit incomplete evidence", () => {
       expect(good.meta.parse_errors).toBe(0)
       expect(good.text).toBe("")
       expect((await run(name, [meta], [], '{"broken":')).meta.parse_errors).toBe(1)
-      expect((await run(name, [meta, row("response_item", { type: "future-tool" })])).meta.unknown_records).toBe(1)
+      const unknown = await run(name, [meta, row("response_item", { type: "future_tool" }), row("event_msg", { type: "unsafe arbitrary body / value" })])
+      expect(unknown.meta.unknown_records).toBe(2)
+      expect(unknown.meta.unknown_record_types).toEqual({ "response_item:future_tool": 1, "event_msg:unknown": 1 })
+      expect(JSON.stringify(unknown.meta)).not.toContain("unsafe arbitrary body")
     }
   })
   test("overlong, redacted and explicitly omitted output stay visible", async () => {

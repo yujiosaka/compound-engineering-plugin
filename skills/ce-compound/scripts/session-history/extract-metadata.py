@@ -651,10 +651,26 @@ def message_text(content):
     return ""
 
 
+def unknown_record(diagnostics, obj):
+    """Expose bounded grammar tags, never message bodies or argument values."""
+    import re
+    def tag(value):
+        return value if isinstance(value, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value) else "unknown"
+    key = tag(obj.get("type"))
+    if key in ("response_item", "event_msg"):
+        payload = obj.get("payload")
+        key += ":" + tag(payload.get("type") if isinstance(payload, dict) else None)
+    counts = diagnostics["unknown_record_types"]
+    if key not in counts and len(counts) >= 31:
+        key = "other"
+    counts[key] = counts.get(key, 0) + 1
+    diagnostics["unknown_records"] += 1
+
+
 def prepare_records(objects, platform):
     diagnostics = dict(platform=platform, unsupported=platform not in ("claude", "codex", "pi", "omp"), unknown_records=0,
                        omitted=0, truncated=0, identity_conflicts=0, unmatched_calls=0, unmatched_results=0,
-                       unknown_results=0, tool_observations=[])
+                       unknown_results=0, tool_observations=[], unknown_record_types={})
     diagnostics["identity_conflicts"] += reader_metadata([json.dumps(obj) for obj in objects])["identity_conflicts"]
     if platform == "codex":
         known = {"session_meta", "turn_context", "response_item", "event_msg", "compacted"}
@@ -663,11 +679,13 @@ def prepare_records(objects, platform):
                     "exec_command_begin", "exec_command_end", "exec_command_output_delta", "context_compacted"}
         for obj in objects:
             if obj.get("type") not in known or (obj.get("type") in ("response_item", "event_msg") and (not isinstance(obj.get("payload"), dict) or obj["payload"].get("type") not in payloads)):
-                diagnostics["unknown_records"] += 1
+                unknown_record(diagnostics, obj)
         objects = codex_records(objects, diagnostics)
     elif platform == "claude":
         known = {"user", "assistant", "system", "progress", "file-history-snapshot", "queue-operation", "summary", "last-prompt", "custom-title", "agent-name", "agent-color", "pr-link", "saved_hook_context", "bridge_status"}
-        diagnostics["unknown_records"] = sum(obj.get("type") not in known for obj in objects)
+        for obj in objects:
+            if obj.get("type") not in known:
+                unknown_record(diagnostics, obj)
         calls = {}
         for obj in objects:
             message = obj.get("message", {})
@@ -698,6 +716,9 @@ def prepare_records(objects, platform):
                     diagnostics["tool_observations"].append({"call_id": identity, "name": (call or {}).get("name", "unknown"), "executed_cwd": inp.get("cwd", inp.get("workdir")) if isinstance(inp, dict) else None, "status": "error" if block.get("is_error") else "ok", "timestamp": obj.get("timestamp"), "result_digest": hashlib.sha256(json.dumps(block.get("content"), sort_keys=True, separators=(",", ":")).encode()).hexdigest()})
                     diagnostics["omitted"] += result_evidence(block.get("content"))[2]
         diagnostics["unmatched_calls"] += len(calls)
+    elif platform not in ("pi", "omp", "cursor"):
+        for obj in objects:
+            unknown_record(diagnostics, obj)
     # The rendered skeleton is deliberately bounded; report every lossy excerpt.
     for obj in objects:
         if obj.get("type") == "_reader_tool":
