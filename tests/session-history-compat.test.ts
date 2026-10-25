@@ -58,6 +58,27 @@ describe("native result grammar and explicit incomplete evidence", () => {
     const out = await run("extract-skeleton.py", [meta, row("response_item", { type: "message", role: "user", content: [{ type: "input_text", text: "Again" }] }), { ...row("event_msg", { type: "user_message", message: "Again" }), timestamp: "2025-01-01T00:01:00Z" }])
     expect(out.meta.user).toBe(2)
   })
+  test("native completed execution keeps cwd and failure while unknown association stays pending", async () => {
+    const completed = (id: string, code: number) => row("event_msg", { type: "item_completed", item: { type: "CommandExecution", id, cwd, exit_code: code, command: "synthetic check", aggregated_output: "synthetic output", status: code ? "failed" : "completed" } })
+    const rows = [meta, completed("native-failed", 1), completed("native-passed", 0)]
+    const out = await run("extract-skeleton.py", rows)
+    expect(out.meta.tool).toBe(2)
+    expect(out.meta.unmatched_results).toBe(2)
+    expect(out.meta.tool_observations.map((o: any) => [o.executed_cwd, o.status])).toEqual([[cwd, "error"], [cwd, "ok"]])
+    expect((await run("extract-errors.py", rows)).meta.errors_found).toBe(1)
+    const aliased = await run("extract-skeleton.py", [meta, call("same"), result("same", { exit_code: 0 }), completed("same", 0)])
+    expect(aliased.meta.tool).toBe(1)
+    expect(aliased.meta.unmatched_results).toBe(0)
+    const nativeTools = await run("extract-skeleton.py", [meta, ...["McpToolCall", "FileChange"].map(type => row("event_msg", { type: "item_completed", item: { type, id: type, status: "failed", result: { isError: true } } }))])
+    expect(nativeTools.meta.tool).toBe(2)
+    expect(nativeTools.meta.unmatched_results).toBe(2)
+    expect(nativeTools.meta.tool_observations.every((o: any) => o.status === "error")).toBe(true)
+    const supplemental = await run("extract-skeleton.py", [meta, call("same"), result("same", "command response"), completed("same", 0)])
+    expect(supplemental.meta.tool_observations[0].status).toBe("ok")
+    const metadata = await run("extract-skeleton.py", [meta, row("response_item", { type: "additional_tools", tools: [] }), row("event_msg", { type: "thread_settings_applied" }), ...["world_state", "inter_agent_communication_metadata", "token_usage_record"].map(type => row(type, {})), ...["Reasoning", "AgentMessage", "SubAgentActivity"].map(type => row("event_msg", { type: "item_completed", item: { type } }))])
+    expect(metadata.meta.unknown_records).toBe(0)
+    expect(metadata.meta.tool).toBe(0)
+  })
   test("missing executed cwd never inherits session cwd; orphan IDs stay incomplete", async () => {
     const out = await run("extract-skeleton.py", [meta, call("unknown", false, { cmd: "check" }), result("unknown", { exit_code: 0 }), result("orphan", { exit_code: 0 }), call("unfinished")])
     expect(out.meta.tool_observations[0].executed_cwd).toBeNull()
@@ -77,6 +98,18 @@ describe("native result grammar and explicit incomplete evidence", () => {
       expect(unknown.meta.unknown_record_types).toEqual({ "response_item:future_tool": 1, "event_msg:unknown": 1 })
       expect(JSON.stringify(unknown.meta)).not.toContain("unsafe arbitrary body")
     }
+  })
+  test("unknown message blocks, invalid containers and missing text cannot become supported zero", async () => {
+    for (const content of [[{ type: "future_text", text: "Synthetic correction" }], { content: [{ type: "input_text", text: "Synthetic correction" }] }, [{ type: "input_text" }], [null]]) {
+      for (const name of ["extract-skeleton.py", "extract-errors.py"]) {
+        const out = await run(name, [meta, row("response_item", { type: "message", role: "user", content })])
+        expect(out.meta.unknown_records).toBeGreaterThan(0)
+      }
+    }
+    const redacted = await run("extract-skeleton.py", [meta, row("response_item", { type: "message", role: "user", content: [{ type: "input_text", text: "[REDACTED]" }] })])
+    expect(redacted.meta.omitted).toBe(1)
+    const claude = await run("extract-skeleton.py", [{ type: "user", cwd, sessionId: "c", message: { content: [{ type: "future_text", text: "Synthetic correction" }] } }])
+    expect(claude.meta.unknown_records).toBeGreaterThan(0)
   })
   test("overlong, redacted and explicitly omitted output stay visible", async () => {
     const out = await run("extract-skeleton.py", [meta, row("response_item", { type: "message", role: "user", content: [{ type: "input_text", text: "x".repeat(801) }] }), call("long", false, { cmd: "c".repeat(121) }), result("long", { exit_code: 1, output: "[REDACTED]" + "x".repeat(201), truncated: true })])

@@ -541,8 +541,28 @@ def result_evidence(value, depth=0):
     return codes, flags, omitted
 
 
+def completed_item(obj):
+    """Keep native execution evidence without guessing its outer tool call."""
+    p = obj.get("payload", {})
+    if obj.get("type") != "event_msg" or not isinstance(p, dict) or p.get("type") != "item_completed":
+        return obj
+    item = p.get("item", {})
+    if not isinstance(item, dict) or item.get("type") not in ("CommandExecution", "McpToolCall", "FileChange"):
+        return obj
+    result = {"type": "exec_command_end", "call_id": item.get("id"), "requires_association": True,
+              "name": item.get("tool") if isinstance(item.get("tool"), str) else item["type"],
+              "cwd": item.get("cwd"), "command": item.get("command", ""),
+              "output": item.get("result"), "aggregated_output": item.get("aggregated_output", item.get("stdout", ""))}
+    if "exit_code" in item:
+        result["exit_code"] = item["exit_code"]
+    if item.get("status") == "failed":
+        result["is_error"] = True
+    return {**obj, "payload": result}
+
+
 def codex_records(objects, diagnostics):
     """Join native call IDs; aliases are removed only when their identity is proven."""
+    objects = [completed_item(obj) for obj in objects]
     calls, results, messages, normalized, aliases = {}, {}, {}, [], {}
     for obj in objects:
         p = obj.get("payload", {})
@@ -564,8 +584,12 @@ def codex_records(objects, diagnostics):
                 diagnostics["identity_conflicts"] += 1
             results[identity] = p
         elif obj.get("type") == "event_msg" and kind == "exec_command_end" and identity:
-            if identity in aliases and aliases[identity] != p:
-                diagnostics["identity_conflicts"] += 1
+            previous = aliases.get(identity)
+            if previous:
+                old_codes = result_evidence(previous)[0] + result_evidence(previous.get("aggregated_output", ""))[0]
+                new_codes = result_evidence(p)[0] + result_evidence(p.get("aggregated_output", ""))[0]
+                if (previous.get("cwd") and p.get("cwd") and previous["cwd"] != p["cwd"]) or (old_codes and new_codes and set(old_codes) != set(new_codes)):
+                    diagnostics["identity_conflicts"] += 1
             aliases[identity] = p
         elif obj.get("type") == "response_item" and kind == "message":
             text = message_text(p.get("content"))
@@ -603,7 +627,7 @@ def codex_records(objects, diagnostics):
             if identity:
                 emitted.add(identity)
             call = calls.get(identity, {})
-            if not identity or (not call and not is_alias):
+            if not identity or (not call and (not is_alias or p.get("requires_association"))):
                 diagnostics["unmatched_results"] += 1
             arguments = call.get("arguments", call.get("input", {}))
             if isinstance(arguments, str):
@@ -622,6 +646,13 @@ def codex_records(objects, diagnostics):
             executed_cwd = cwd_values[0] if len(set(cwd_values)) == 1 else None
             output = p.get("output") if is_result else p
             codes, flags, omitted = result_evidence(output)
+            if is_result and identity in aliases:
+                alias = aliases[identity]
+                more_codes, more_flags, more_omitted = result_evidence(alias)
+                legacy_codes, _, legacy_omitted = result_evidence(alias.get("aggregated_output", ""))
+                codes.extend(more_codes + legacy_codes)
+                flags.extend(more_flags)
+                omitted += more_omitted + legacy_omitted
             if is_alias:
                 extra, _, extra_omitted = result_evidence(p.get("aggregated_output", ""))
                 codes.extend(extra)
@@ -633,7 +664,7 @@ def codex_records(objects, diagnostics):
             command = arguments.get("cmd", arguments.get("command", p.get("command", "")))
             if isinstance(command, list):
                 command = command[-1] if command else ""
-            name = call.get("name", "exec" if is_alias else "unknown")
+            name = call.get("name", p.get("name", "exec") if is_alias else "unknown")
             observation = {"call_id": identity, "name": name, "executed_cwd": executed_cwd, "status": status, "timestamp": obj.get("timestamp"), "result_digest": hashlib.sha256(json.dumps(output, sort_keys=True, separators=(",", ":")).encode()).hexdigest()}
             diagnostics["tool_observations"].append(observation)
             normalized.append({"type": "_reader_tool", "timestamp": obj.get("timestamp", ""), **observation, "target": command if isinstance(command, str) else "", "output": output, "exit_codes": codes})
@@ -667,19 +698,54 @@ def unknown_record(diagnostics, obj):
     diagnostics["unknown_records"] += 1
 
 
+def inspect_message_content(content, platform, diagnostics):
+    """Unrenderable message content is missing evidence, never a supported zero."""
+    if isinstance(content, str):
+        diagnostics["omitted"] += int("[REDACTED]" in content or "[TRUNCATED]" in content)
+        return
+    if not isinstance(content, list):
+        unknown_record(diagnostics, {"type": "message_content"})
+        return
+    text_types = {"input_text", "output_text"} if platform == "codex" else {"text"}
+    for block in content:
+        if not isinstance(block, dict):
+            unknown_record(diagnostics, {"type": "message_content"})
+        elif block.get("type") in text_types:
+            if not isinstance(block.get("text"), str):
+                unknown_record(diagnostics, {"type": "message_content"})
+            else:
+                inspect_message_content(block["text"], platform, diagnostics)
+        elif block.get("type") in ("image", "input_image", "image_url", "audio", "input_audio"):
+            diagnostics["omitted"] += 1
+        elif platform != "claude" or block.get("type") not in ("tool_use", "tool_result", "thinking", "redacted_thinking"):
+            unknown_record(diagnostics, {"type": "message_content"})
+
+
 def prepare_records(objects, platform):
     diagnostics = dict(platform=platform, unsupported=platform not in ("claude", "codex", "pi", "omp"), unknown_records=0,
                        omitted=0, truncated=0, identity_conflicts=0, unmatched_calls=0, unmatched_results=0,
                        unknown_results=0, tool_observations=[], unknown_record_types={})
     diagnostics["identity_conflicts"] += reader_metadata([json.dumps(obj) for obj in objects])["identity_conflicts"]
+    for obj in objects:
+        p = obj.get("payload") if platform == "codex" else obj.get("message")
+        is_message = (platform == "codex" and obj.get("type") == "response_item" and isinstance(p, dict) and p.get("type") == "message") or (platform == "claude" and obj.get("type") in ("user", "assistant"))
+        if is_message:
+            inspect_message_content(p.get("content") if isinstance(p, dict) else None, platform, diagnostics)
+        elif platform == "codex" and obj.get("type") == "event_msg" and isinstance(p, dict) and p.get("type") in ("user_message", "agent_message"):
+            inspect_message_content(p.get("message"), platform, diagnostics)
     if platform == "codex":
-        known = {"session_meta", "turn_context", "response_item", "event_msg", "compacted"}
+        known = {"session_meta", "turn_context", "response_item", "event_msg", "compacted", "world_state", "inter_agent_communication_metadata", "token_usage_record"}
         payloads = {"message", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "reasoning",
                     "user_message", "agent_message", "agent_reasoning", "token_count", "task_started", "task_complete", "turn_aborted",
-                    "exec_command_begin", "exec_command_end", "exec_command_output_delta", "context_compacted"}
+                    "exec_command_begin", "exec_command_end", "exec_command_output_delta", "context_compacted", "additional_tools", "thread_settings_applied", "item_completed"}
         for obj in objects:
             if obj.get("type") not in known or (obj.get("type") in ("response_item", "event_msg") and (not isinstance(obj.get("payload"), dict) or obj["payload"].get("type") not in payloads)):
                 unknown_record(diagnostics, obj)
+            p = obj.get("payload", {})
+            if obj.get("type") == "event_msg" and isinstance(p, dict) and p.get("type") == "item_completed":
+                item = p.get("item", {})
+                if not isinstance(item, dict) or item.get("type") not in ("Reasoning", "AgentMessage", "SubAgentActivity", "CommandExecution", "McpToolCall", "FileChange"):
+                    unknown_record(diagnostics, obj)
         objects = codex_records(objects, diagnostics)
     elif platform == "claude":
         known = {"user", "assistant", "system", "progress", "file-history-snapshot", "queue-operation", "summary", "last-prompt", "custom-title", "agent-name", "agent-color", "pr-link", "saved_hook_context", "bridge_status"}
@@ -728,8 +794,6 @@ def prepare_records(objects, platform):
             if isinstance(p, dict):
                 content = p.get("content", "")
                 diagnostics["truncated"] += int(len(message_text(content)) > 800)
-                if isinstance(content, str) and content == "[REDACTED]":
-                    diagnostics["omitted"] += 1
                 if isinstance(content, list):
                     for block in content:
                         if isinstance(block, dict) and block.get("type") == "tool_use":
@@ -738,7 +802,6 @@ def prepare_records(objects, platform):
                                 diagnostics["truncated"] += int(any(isinstance(v, str) and len(v) > 120 for v in inp.values()))
                         elif isinstance(block, dict) and block.get("type") == "tool_result":
                             diagnostics["truncated"] += int(len(str(block.get("content", ""))) > 200)
-                    diagnostics["omitted"] += sum(isinstance(b, dict) and b.get("type") in ("image", "input_image", "audio", "image_url") for b in content)
     return objects, diagnostics
 
 
