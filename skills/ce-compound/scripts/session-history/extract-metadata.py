@@ -860,6 +860,37 @@ def full_identity(objects):
     return identity
 
 
+def record_platform(obj, title_slot=False):
+    if obj.get("type") == "session" and "cwd" in obj:
+        return "omp" if title_slot else "pi"
+    if obj.get("type") in ("user", "assistant"):
+        return "claude"
+    if obj.get("type") in ("session_meta", "turn_context", "response_item", "event_msg"):
+        return "codex"
+    if obj.get("role") in ("user", "assistant") and "type" not in obj:
+        return "cursor"
+    return None
+
+
+def claude_tool_step(block, calls, diagnostics, identify=lambda value: value, retain=lambda value: value):
+    # Claude results consume preceding calls once; unlike Codex, order matters.
+    kind = block.get("type")
+    identity = block.get("id" if kind == "tool_use" else "tool_use_id")
+    key = identify(identity) if isinstance(identity, str) else None
+    if kind == "tool_use":
+        if key is None:
+            diagnostics["unmatched_calls"] += 1
+        elif key in calls:
+            diagnostics["identity_conflicts"] += 1
+        else:
+            calls[key] = retain(block)
+        return None
+    call = calls.pop(key, None)
+    if call is None:
+        diagnostics["unmatched_results"] += 1
+    return call
+
+
 def prepare_records(objects, platform):
     diagnostics = dict(platform=platform, unsupported=platform not in ("claude", "codex", "pi", "omp"), unknown_records=0,
                        omitted=0, truncated=0, identity_conflicts=0, unmatched_calls=0, unmatched_results=0,
@@ -927,20 +958,12 @@ def prepare_records(objects, platform):
                     diagnostics["unknown_records"] += 1
                     continue
                 if block.get("type") == "tool_use":
-                    identity = block.get("id")
-                    if not isinstance(identity, str):
-                        diagnostics["unmatched_calls"] += 1
-                    elif identity in calls:
-                        diagnostics["identity_conflicts"] += 1
-                    else:
-                        calls[identity] = block
+                    claude_tool_step(block, calls, diagnostics)
                 elif block.get("type") == "tool_result":
                     identity = block.get("tool_use_id")
                     if not isinstance(identity, str):
                         identity = None
-                    call = calls.pop(identity, None)
-                    if not call:
-                        diagnostics["unmatched_results"] += 1
+                    call = claude_tool_step(block, calls, diagnostics)
                     inp = (call or {}).get("input", {})
                     diagnostics["tool_observations"].append({"call_id": identity, "name": (call or {}).get("name", "unknown"), "executed_cwd": inp.get("cwd", inp.get("workdir")) if isinstance(inp, dict) else None, "status": "error" if block.get("is_error") else "ok", "timestamp": obj.get("timestamp"), "result_digest": hashlib.sha256(json.dumps(block.get("content"), sort_keys=True, separators=(",", ":")).encode()).hexdigest()})
                     diagnostics["omitted"] += result_evidence(block.get("content"))[2]
@@ -972,6 +995,16 @@ def prepare_records(objects, platform):
 def record_fingerprint(obj):
     """The selector names parsed content, independently of JSON whitespace/key order."""
     return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def claude_tool_facts(obj):
+    message = obj.get("message", {})
+    content = message.get("content", []) if isinstance(message, dict) else []
+    for block in content if isinstance(content, list) else []:
+        if isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result"):
+            key = (block["type"], block.get("id" if block["type"] == "tool_use" else "tool_use_id"))
+            if isinstance(key[1], str):
+                yield key, record_fingerprint(block)
 
 
 def record_links(obj, platform):
@@ -1062,13 +1095,8 @@ def prepare_window(objects, platform, start, end, parse_errors=0, boundaries=Fal
     facts = {}
     if platform == "claude":
         for obj in objects:
-            msg = obj.get("message", {})
-            content = msg.get("content", []) if isinstance(msg, dict) else []
-            for block in content if isinstance(content, list) else []:
-                if isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result"):
-                    key = (block["type"], block.get("id" if block["type"] == "tool_use" else "tool_use_id"))
-                    if isinstance(key[1], str):
-                        facts.setdefault(key, set()).add(record_fingerprint(block))
+            for key, fingerprint in claude_tool_facts(obj):
+                facts.setdefault(key, set()).add(fingerprint)
     # Reusing a native record/message identity for different content is global,
     # even when every conflicting copy lies outside the requested range.
     for obj in objects:
@@ -1181,6 +1209,35 @@ class PrefixSource:
         if time.monotonic() >= self.deadline:
             raise StreamLimit("scan-timeout")
 
+    @staticmethod
+    def signature(observed):
+        return (observed.st_dev, observed.st_ino, observed.st_size,
+                observed.st_mtime_ns, observed.st_ctime_ns)
+
+    def verify_prefix(self, source, expected):
+        # A changed stat may be append-only, but size growth cannot prove that.
+        # Rehash the fixed prefix once and require a stable verification pass.
+        before = os.fstat(source.fileno())
+        source.seek(0)
+        sha, remaining = hashlib.sha256(), self.size
+        self.passes += 1
+        while remaining:
+            self.check()
+            raw = source.read(min(64 * 1024, remaining))
+            if not raw:
+                raise StreamLimit("prefix-short-read")
+            self.bytes += len(raw)
+            remaining -= len(raw)
+            sha.update(raw)
+        after = os.fstat(source.fileno())
+        path_after = os.stat(self.path, follow_symlinks=False)
+        if self.signature(before) != self.signature(after) or self.signature(after) != self.signature(path_after):
+            raise StreamLimit("prefix-unstable")
+        if sha.hexdigest() != expected:
+            raise StreamLimit("prefix-changed")
+        self.check()
+        return after
+
     def rows(self):
         import stat
         self.check()
@@ -1227,6 +1284,8 @@ class PrefixSource:
             value = sha.hexdigest()
             if (self.expected and value != self.expected) or (self.sha and value != self.sha):
                 raise StreamLimit("prefix-changed")
+            if self.signature(observed) != self.signature(after) or self.signature(after) != self.signature(path_after):
+                after = self.verify_prefix(source, value)
             self.sha = value
             self.appended = max(0, after.st_size - self.size)
             self.records = ordinal
@@ -1265,6 +1324,7 @@ class StreamIndex:
         self.invalid, self.child = False, False
         self.unknown, self.parse_errors, self.unknown_links = 0, 0, 0
         self.conflicts = 0
+        self.claude_tools = {"identity_conflicts": 0, "unmatched_calls": 0, "unmatched_results": 0}
         self.types = {}
         self.omitted, self.truncated = 0, 0
 
@@ -1350,13 +1410,15 @@ class StreamIndex:
         if key not in self.messages:
             self.reserve(160)
             self.messages[key] = signature
-        elif self.messages[key] != signature:
+        elif self.messages[key] != signature and self.messages[key] != -1:
             self.conflicts += 1
+            self.messages[key] = -1  # One conflict per native fact, as in prepare_window.
 
     def add(self, obj, platform):
         self.add_identity(obj)
         _, diag = prepare_records([obj], platform)
-        self.conflicts += diag["identity_conflicts"] - sum(len(diag["full_identity"][k]) > 1 for k in self.identities)
+        if platform != "claude":
+            self.conflicts += diag["identity_conflicts"] - sum(len(diag["full_identity"][k]) > 1 for k in self.identities)
         self.unknown += diag["unknown_records"]
         for key, value in diag["unknown_record_types"].items():
             self.types[key if key in self.types or len(self.types) < 31 else "other"] = self.types.get(key, 0) + value
@@ -1421,21 +1483,19 @@ class StreamIndex:
                     if group[at] == -1: group[at] = value
                     elif group[at] != value: self.conflicts += 1
         elif platform == "claude":
+            for key, fingerprint in claude_tool_facts(obj):
+                self.message(("claude-tool", *key), self.atom(fingerprint))
             if isinstance(obj.get("uuid"), str) and obj["uuid"]:
                 self.message(["record", obj["uuid"]], self.atom(obj))
             msg = obj.get("message", {})
             content = msg.get("content", []) if isinstance(msg, dict) else []
             for b in content if isinstance(content, list) else []:
                 if not isinstance(b, dict) or b.get("type") not in ("tool_use", "tool_result"): continue
-                identity = b.get("id" if b["type"] == "tool_use" else "tool_use_id")
-                if not isinstance(identity, str) or not identity:
-                    self.unknown_links += 1; continue
-                key = self.atom(("tool", identity))
-                table = self.calls if b["type"] == "tool_use" else self.results
-                value = self.atom(b)
-                if key in table and table[key] != value: self.conflicts += 1
-                elif key not in table:
-                    self.reserve(80); table[key] = value
+                def retain(block):
+                    self.reserve(80)
+                    return True  # The sequential state needs no tool body.
+                claude_tool_step(b, self.calls, self.claude_tools,
+                                 identify=lambda identity: self.atom(("tool", identity)), retain=retain)
 
     def finish(self, platform):
         if platform == "codex":
@@ -1454,9 +1514,14 @@ class StreamIndex:
         identity = {**self.identities, "child_context": bool(self.child or self.identities["parent_session"]), "metadata_missing": missing,
                     "invalid": bool(self.invalid or missing or (self.child and not self.identities["parent_session"]))}
         conflicts = self.conflicts + sum(len(v) > 1 for v in self.identities.values())
-        unmatched_results = sum(k not in self.calls and (platform == "claude" or v[-1]) for k, v in self.results.items())
+        unmatched_results = sum(k not in self.calls and v[-1] for k, v in self.results.items())
+        unmatched_calls = len(set(self.calls) - set(self.results))
+        if platform == "claude":
+            conflicts += self.claude_tools["identity_conflicts"]
+            unmatched_calls = len(self.calls) + self.claude_tools["unmatched_calls"]
+            unmatched_results = self.claude_tools["unmatched_results"]
         return {"unsupported": platform not in ("claude", "codex"), "identity_conflicts": conflicts, "unknown_records": self.unknown,
-                "unmatched_calls": len(set(self.calls) - set(self.results)), "unmatched_results": unmatched_results,
+                "unmatched_calls": unmatched_calls, "unmatched_results": unmatched_results,
                 "parse_errors": self.parse_errors, "unknown_links": self.unknown_links + int(identity["invalid"]),
                 "selection_errors": 0, "metadata_missing": missing}, identity
 
@@ -1473,6 +1538,32 @@ def stream_failure(reason, source=None, index=None):
         diag.update(source.report(index))
         diag["coverage"].update(complete_source=False, appended_bytes=None)
     return {"platform": "unknown", "objects": [], "boundaries": [], "meta": diag, "lines": source.records if source else 0}
+
+
+def platform_rows(source):
+    pending, pending_bytes, platform = [], 0, None
+    title_slot = False
+    for row in source.rows():
+        if platform is None:
+            pending_bytes += row[2]
+            if pending_bytes > MAX_BYTES or len(pending) >= STREAM_INDEX_ENTRIES:
+                raise StreamLimit("leading-record-limit")
+            pending.append(row)
+            obj = row[3]
+            if obj is not None:
+                title_slot |= len(pending) == 1 and obj.get("type") == "title"
+                platform = record_platform(obj, title_slot)
+            if platform is None:
+                continue
+            if platform not in ("claude", "codex"):
+                raise StreamLimit("unsupported-platform")
+            for buffered in pending:
+                yield buffered, platform
+            pending.clear()
+        else:
+            yield row, platform
+    if platform is None:
+        raise StreamLimit("unsupported-platform")
 
 
 def stream_window(args):
@@ -1493,14 +1584,10 @@ def stream_window(args):
         if since is not None and until is not None and since > until: raise StreamLimit("invalid-period")
         platform, first, last, start_count, end_count = None, None, None, 0, 0
         headers, eligible, rows_count = [], 0, 0
-        for ordinal, offset, length, obj in source.rows():
+        for (ordinal, offset, length, obj), platform in platform_rows(source):
             rows_count += 1
             if obj is None:
                 index.parse_errors += 1; continue
-            if platform is None:
-                if obj.get("type") in ("session_meta", "turn_context", "response_item", "event_msg"): platform = "codex"
-                elif obj.get("type") in ("user", "assistant"): platform = "claude"
-            if platform is None: raise StreamLimit("unsupported-leading-record")
             fp = record_fingerprint(obj)
             if fp in (args.start_record, args.end_record):
                 stamp = instant(obj.get("timestamp"))

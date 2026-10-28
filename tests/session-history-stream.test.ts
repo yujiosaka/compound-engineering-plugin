@@ -200,3 +200,157 @@ test("a supported record just below the byte ceiling keeps truncation explicit",
     expect(out.text.length).toBeLessThan(1000)
   })
 })
+test("final-pass rewrites fail closed while verified append-only changes stay outside coverage", async () => {
+  const selected = message("selected")
+  for (const scenario of ["rewrite", "rewrite-append", "append", "replace", "verification-rewrite", "verification-append", "verification-replace"]) {
+    await fixture([meta, selected], async f => {
+      const program = `import runpy,argparse,os
+m=runpy.run_path(${JSON.stringify(join(dir, "extract-metadata.py"))})
+p=argparse.ArgumentParser();m['stream_arguments'](p);p.add_argument('--start-record');p.add_argument('--end-record');p.add_argument('--json',action='store_true');a=p.parse_args()
+scenario=${JSON.stringify(scenario)}
+def replace(path):
+ with open(path,'rb') as f: raw=f.read()
+ with open(path+'.replacement','wb') as f: f.write(raw)
+ os.replace(path+'.replacement',path)
+def rewrite(path):
+ with open(path,'r+b') as f:
+  raw=f.read();f.seek(0);f.write(raw.replace(b'synthetic',b'synthetiX'))
+old=m['PrefixSource'].rows
+def modified(self):
+ for row in old(self):
+  yield row
+  if self.passes==2 and row[0]==0:
+   if scenario.startswith('rewrite'): rewrite(self.path)
+   if scenario=='replace': replace(self.path)
+   if scenario not in ('rewrite','replace'):
+    with open(self.path,'ab') as f: f.write(b'{}\\n')
+m['PrefixSource'].rows=modified
+verify=m['PrefixSource'].verify_prefix
+class ChangedRead:
+ def __init__(self,source,path): self.source,self.path,self.changed=source,path,False
+ def __getattr__(self,name): return getattr(self.source,name)
+ def read(self,n):
+  raw=self.source.read(n)
+  if not self.changed:
+   self.changed=True
+   if scenario=='verification-rewrite': rewrite(self.path)
+   elif scenario=='verification-replace': replace(self.path)
+   else:
+    with open(self.path,'ab') as f: f.write(b'{}\\n')
+  return raw
+def verification(self,source,expected):
+ return verify(self,ChangedRead(source,self.path) if scenario.startswith('verification-') else source,expected)
+m['PrefixSource'].verify_prefix=verification
+print(m['bounded_json'](m['stream_window'](a)))`
+      const out = await execute(["python3", "-c", program, ...f.args, "--start-record", fp(selected), "--end-record", fp(selected)])
+      const passes = scenario === "replace" ? 2 : 3
+      expect(out.meta.scan.passes).toBe(passes)
+      expect(out.meta.scan.bytes).toBe(f.content.length * passes)
+      expect(out.meta.scan.additional_disk_bytes).toBe(0)
+      expect(out.meta.coverage.complete_source).toBe(false)
+      if (scenario === "append") {
+        expect(out.meta.incomplete_reason).toBeUndefined()
+        expect(out.meta.coverage.appended_bytes).toBe(3)
+        expect(out.meta.selection.valid).toBe(true)
+        expect(out.meta.global.unknown_records).toBe(0)
+      } else {
+        expect(out.meta.incomplete_reason).toBe(scenario.startsWith("verification-") ? "prefix-unstable" : scenario === "replace" ? "source-replaced" : "prefix-changed")
+        expect(out.meta.coverage.appended_bytes).toBeNull()
+        expect(out.objects).toEqual([])
+        expect(out.meta.global.selection_errors).toBeGreaterThan(0)
+      }
+    })
+  }
+})
+test("leading metadata is replayed through the shared platform detector and global diagnostics", async () => {
+  const claude = { type: "user", timestamp: stamp, sessionId: "synthetic", cwd: "/synthetic", version: "synthetic", uuid: "u", message: { content: [{ type: "text", text: "selected" }] } }
+  const codex = message("selected")
+  const cases = [
+    [{ type: "file-history-snapshot", snapshot: {} }, claude],
+    [{ type: "world_state", payload: {} }, meta, codex],
+    [{ type: "future-record" }, meta, codex],
+  ]
+  for (const rows of cases) await fixture(rows, async f => {
+    const select = ["--start-record", fp(rows.at(-1)), "--end-record", fp(rows.at(-1))]
+    for (const name of ["extract-skeleton.py", "extract-errors.py"]) {
+      const old = await execute(["python3", join(dir, name), "--json", ...select], f.content)
+      const out = await f.run(name, select)
+      expect(out.meta.incomplete_reason).toBeUndefined()
+      expect(out.text).toBe(old.text)
+      expect(out.meta.global).toEqual(old.meta.global)
+    }
+  })
+})
+test("leading lookahead stops at independent aggregate byte and record bounds", async () => {
+  const selected = message("selected")
+  for (const leading of [Array.from({ length: 9 }, () => ({ type: "world_state", payload: "x".repeat(1024 ** 2) })), Array(400001).fill({})]) {
+    await fixture([...leading, meta, selected], async f => {
+      const out = await f.run("extract-skeleton.py", ["--start-record", fp(selected), "--end-record", fp(selected)])
+      expect(out.meta.incomplete_reason).toBe("leading-record-limit")
+      expect(out.text).toBe("")
+      expect(out.meta.coverage.complete_source).toBe(false)
+      expect(out.meta.scan.additional_disk_bytes).toBe(0)
+      expect(out.meta.scan.passes).toBe(1)
+    })
+  }
+}, 30000)
+test("Claude consumes preceding calls once while Codex retains order-independent association", async () => {
+  const row = (type: string, content: unknown[], uuid: string) => ({ type, timestamp: stamp, uuid, sessionId: "synthetic", cwd: "/synthetic", version: "synthetic", message: { content } })
+  const selected = row("user", [{ type: "text", text: "selected" }], "selected")
+  const callBlock = { type: "tool_use", id: "c", name: "Check", input: {} }
+  const resultBlock = { type: "tool_result", tool_use_id: "c", is_error: false, content: "ok" }
+  const call = row("assistant", [callBlock], "call"), result = row("user", [resultBlock], "result")
+  const changedCall = row("assistant", [{ ...callBlock, name: "Other" }], "changed-call")
+  const changedResult = row("user", [{ ...resultBlock, is_error: true, content: "different" }], "changed-result")
+  const sequences = [[result, call], [call, result, result], [call, call, result], [call, result, call, result], [row("assistant", [callBlock, callBlock], "double"), result], [call, result, changedCall, changedResult], [call, result, changedCall, changedResult, changedCall, changedResult]]
+  for (const sequence of sequences) await fixture([selected, ...sequence], async f => {
+    const select = ["--start-record", fp(selected), "--end-record", fp(selected)]
+    for (const name of ["extract-skeleton.py", "extract-errors.py"]) {
+      const old = await execute(["python3", join(dir, name), "--json", ...select], f.content)
+      const out = await f.run(name, select)
+      expect(out.meta.global).toEqual(old.meta.global)
+      expect(out.text).toBe(old.text)
+    }
+  })
+  const codex = message("selected")
+  await fixture([meta, codex,
+    { type: "response_item", timestamp: stamp, payload: { type: "function_call_output", call_id: "c", output: { exit_code: 0 } } },
+    { type: "response_item", timestamp: stamp, payload: { type: "function_call", call_id: "c", name: "exec", arguments: "{}" } },
+  ], async f => {
+    const out = await f.run("extract-skeleton.py", ["--start-record", fp(codex), "--end-record", fp(codex)])
+    expect(out.meta.global.unmatched_calls).toBe(0)
+    expect(out.meta.global.unmatched_results).toBe(0)
+  })
+})
+test("bounded Claude call-result sequences preserve legacy diagnostics inside and outside windows", async () => {
+  const row = (content: unknown[], uuid: string) => ({ type: "user", timestamp: stamp, uuid, sessionId: "synthetic", cwd: "/synthetic", version: "synthetic", message: { content } })
+  const selected = row([{ type: "text", text: "selected" }], "selected")
+  const alphabet = [
+    { type: "tool_use", id: "c", name: "Check", input: {} },
+    { type: "tool_use", id: "c", name: "Other", input: {} },
+    { type: "tool_result", tool_use_id: "c", is_error: false, content: "ok" },
+    { type: "tool_result", tool_use_id: "c", is_error: true, content: "different" },
+  ]
+  const sequences: number[][] = [[]]
+  for (let length = 1; length <= 3; length++) {
+    for (const previous of sequences.filter(s => s.length === length - 1)) {
+      for (let index = 0; index < alphabet.length; index++) sequences.push([...previous, index])
+    }
+  }
+  expect(sequences).toHaveLength(85)
+  for (const sequence of sequences) {
+    const rows = [selected, ...sequence.map((index, ordinal) => row([alphabet[index]], `record-${ordinal}`))]
+    await fixture(rows, async f => {
+      for (const chosen of rows.length === 1 ? [selected] : [selected, rows.at(-1)!]) {
+        const select = ["--start-record", fp(chosen), "--end-record", fp(chosen)]
+        for (const name of ["extract-skeleton.py", "extract-errors.py"]) {
+          const old = await execute(["python3", join(dir, name), "--json", ...select], f.content)
+          const out = await f.run(name, select)
+          expect(out.meta.global).toEqual(old.meta.global)
+          expect(out.meta.selection).toEqual(old.meta.selection)
+          expect(out.text).toBe(old.text)
+        }
+      }
+    })
+  }
+}, 120000)

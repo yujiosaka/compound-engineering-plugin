@@ -542,16 +542,9 @@ else:
         if not detected:
             try:
                 obj = json.loads(line)
-                if obj.get("type") == "session" and "cwd" in obj:
-                    detected = "omp" if seen_title_slot else "pi"
-                elif obj.get("type") == "title" and len(buffer) == 1:
+                if obj.get("type") == "title" and len(buffer) == 1:
                     seen_title_slot = True
-                elif obj.get("type") in ("user", "assistant"):
-                    detected = "claude"
-                elif obj.get("type") in ("session_meta", "turn_context", "response_item", "event_msg"):
-                    detected = "codex"
-                elif obj.get("role") in ("user", "assistant") and "type" not in obj:
-                    detected = "cursor"
+                detected = shared["record_platform"](obj, seen_title_slot)
             except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
                 pass
 
