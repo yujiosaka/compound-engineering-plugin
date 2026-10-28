@@ -354,3 +354,14 @@ test("bounded Claude call-result sequences preserve legacy diagnostics inside an
     })
   }
 }, 120000)
+test("bounded unknown grammar buckets retain every overflow count", async () => {
+  const unknown = Array.from({ length: 35 }, (_, index) => ({ type: `future_${index}` }))
+  await fixture([meta, ...unknown, unknown[0], unknown[34], message("selected")], async f => {
+    const old = await execute(["python3", join(dir, "extract-skeleton.py"), "--boundaries-json"], f.content)
+    const out = await f.run("extract-skeleton.py", ["--boundaries-json"])
+    expect(out.meta.unknown_record_types).toEqual(old.meta.unknown_record_types)
+    expect(out.meta.unknown_record_types.other).toBe(5)
+    expect(out.meta.global.unknown_records).toBe(37)
+    expect(out.meta.global).toEqual(old.meta.global)
+  })
+})

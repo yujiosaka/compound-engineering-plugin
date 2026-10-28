@@ -1421,7 +1421,8 @@ class StreamIndex:
             self.conflicts += diag["identity_conflicts"] - sum(len(diag["full_identity"][k]) > 1 for k in self.identities)
         self.unknown += diag["unknown_records"]
         for key, value in diag["unknown_record_types"].items():
-            self.types[key if key in self.types or len(self.types) < 31 else "other"] = self.types.get(key, 0) + value
+            bucket = key if key in self.types or len(self.types) < 31 else "other"
+            self.types[bucket] = self.types.get(bucket, 0) + value
         self.omitted += diag["omitted"]
         self.truncated += diag["truncated"]
         p = completed_item(obj).get("payload", {})
