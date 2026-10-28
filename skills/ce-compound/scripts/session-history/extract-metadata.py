@@ -541,12 +541,48 @@ def result_evidence(value, depth=0):
     return codes, flags, omitted
 
 
+def known_completed_envelope(obj):
+    p = obj.get("payload")
+    return (isinstance(p, dict) and set(p) == {"type", "thread_id", "turn_id", "item", "started_at_ms", "completed_at_ms"}
+            and p["type"] == "item_completed"
+            and all(isinstance(p[key], str) and p[key] for key in ("thread_id", "turn_id"))
+            and all(isinstance(p[key], int) and not isinstance(p[key], bool) and p[key] >= 0 for key in ("started_at_ms", "completed_at_ms")))
+
+
+def known_completed_user(obj):
+    if not known_completed_envelope(obj):
+        return False
+    item = obj["payload"]["item"]
+    return (isinstance(item, dict) and set(item) == {"type", "id", "content"} and item["type"] == "UserMessage"
+            and isinstance(item["id"], str) and bool(item["id"]) and isinstance(item["content"], list)
+            and all(isinstance(b, dict) and set(b) == {"type", "text", "text_elements"}
+                    and b["type"] == "text" and isinstance(b["text"], str) and b["text_elements"] == [] for b in item["content"]))
+
+
+def known_web_extension(obj):
+    if not known_completed_envelope(obj):
+        return False
+    item = obj["payload"]["item"]
+    if (not isinstance(item, dict) or set(item) != {"type", "kind", "id", "query", "action", "results"}
+            or item["type"] != "Extension" or item["kind"] != "web.search"
+            or not all(isinstance(item[key], str) for key in ("id", "query")) or not item["id"]):
+        return False
+    action = item["action"]
+    if not isinstance(action, dict) or set(action) != {"type", "url"} or action["type"] != "openPage" or not isinstance(action["url"], str):
+        return False
+    fields = {"type", "domain", "ref_id", "snippet", "title", "url"}
+    return isinstance(item["results"], list) and all(isinstance(r, dict) and fields <= set(r) <= fields | {"thumbnail_url"}
+            and r["type"] == "text_result" and all(isinstance(v, str) for v in r.values()) for r in item["results"])
+
+
 def completed_item(obj):
     """Keep native execution evidence without guessing its outer tool call."""
     p = obj.get("payload", {})
     if obj.get("type") != "event_msg" or not isinstance(p, dict) or p.get("type") != "item_completed":
         return obj
     item = p.get("item", {})
+    if known_completed_user(obj):
+        return {**obj, "payload": {"type": "user_message", "id": item["id"], "message": message_text(item["content"])}}
     if not isinstance(item, dict) or item.get("type") not in ("CommandExecution", "McpToolCall", "FileChange"):
         return obj
     result = {"type": "exec_command_end", "call_id": item.get("id"), "requires_association": True,
@@ -587,7 +623,7 @@ def tool_facts(payload):
 def codex_records(objects, diagnostics):
     """Join native call IDs, retaining every result until all evidence is reconciled."""
     objects = [completed_item(obj) for obj in objects]
-    calls, results, messages, normalized, aliases = {}, {}, {}, [], {}
+    calls, results, messages, normalized, aliases, message_ids = {}, {}, {}, [], {}, {}
     for obj in objects:
         p = obj.get("payload", {})
         if not isinstance(p, dict):
@@ -609,7 +645,17 @@ def codex_records(objects, diagnostics):
         elif obj.get("type") == "response_item" and kind == "message":
             key = (p.get("role"), message_text(p.get("content")), obj.get("timestamp"))
             messages[key] = messages.get(key, 0) + 1
+            if isinstance(p.get("id"), str) and p["id"]:
+                message_ids.setdefault(p["id"], set()).add((p.get("role"), message_text(p.get("content"))))
+    native_messages = {}
+    for obj in objects:
+        p = obj.get("payload", {})
+        if isinstance(p, dict) and p.get("type") == "user_message" and isinstance(p.get("id"), str):
+            native_messages.setdefault(p["id"], set()).add(("user", p.get("message")))
+    for identity, values in native_messages.items():
+        diagnostics["identity_conflicts"] += int(len(values | message_ids.get(identity, set())) > 1)
     emitted = set()
+    emitted_messages = set()
     for obj in objects:
         p = obj.get("payload", {})
         if not isinstance(p, dict):
@@ -620,6 +666,11 @@ def codex_records(objects, diagnostics):
         if obj.get("type") == "event_msg" and kind in ("user_message", "agent_message"):
             role = "user" if kind == "user_message" else "assistant"
             key = (role, p.get("message", ""), obj.get("timestamp"))
+            mid = p.get("id")
+            if isinstance(mid, str):
+                if mid in emitted_messages or (role, p.get("message", "")) in message_ids.get(mid, set()):
+                    continue
+                emitted_messages.add(mid)
             if obj.get("timestamp") and messages.get(key, 0):
                 messages[key] -= 1
                 continue
@@ -834,7 +885,11 @@ def prepare_records(objects, platform):
             p = obj.get("payload", {})
             if obj.get("type") == "event_msg" and isinstance(p, dict) and p.get("type") == "item_completed":
                 item = p.get("item", {})
-                if not isinstance(item, dict) or item.get("type") not in ("Reasoning", "AgentMessage", "SubAgentActivity", "CommandExecution", "McpToolCall", "FileChange", "ContextCompaction"):
+                if known_completed_user(obj):
+                    inspect_message_content(message_text(item["content"]), platform, diagnostics)
+                elif known_web_extension(obj):
+                    diagnostics["omitted"] += 1
+                elif not isinstance(item, dict) or item.get("type") not in ("Reasoning", "AgentMessage", "SubAgentActivity", "CommandExecution", "McpToolCall", "FileChange", "ContextCompaction"):
                     unknown_record(diagnostics, obj)
                 elif item.get("type") in ("CommandExecution", "McpToolCall", "FileChange") and item.get("status") not in ("completed", "failed"):
                     unknown_record(diagnostics, obj)
@@ -941,6 +996,7 @@ def record_links(obj, platform):
             if obj.get("timestamp") and p.get("role") in ("user", "assistant"):
                 link("message-alias", json.dumps([p["role"], obj["timestamp"], message_text(p.get("content"))]))
         elif kind in ("user_message", "agent_message") and obj.get("timestamp"):
+            link("message", p.get("id"))
             link("message-alias", json.dumps(["user" if kind == "user_message" else "assistant", obj["timestamp"], p.get("message")]))
         elif kind == "item_completed":
             item = p.get("item", {})
@@ -979,6 +1035,10 @@ def boundary_headers(objects):
         item = p.get("item") if isinstance(p.get("item"), dict) else {}
         native_id = identifier(obj.get("uuid") or p.get("call_id") or p.get("id") or item.get("id"))
         role = p.get("role", obj.get("type"))
+        if p.get("type") in ("user_message", "agent_message"):
+            role = "user" if p["type"] == "user_message" else "assistant"
+        elif item.get("type") in ("UserMessage", "AgentMessage"):
+            role = "user" if item["type"] == "UserMessage" else "assistant"
         if native_id:
             row["native_id"] = native_id
         if role in ("user", "assistant", "system", "developer"):
@@ -1081,6 +1141,487 @@ def prepare_window(objects, platform, start, end, parse_errors=0, boundaries=Fal
     return chosen, diag
 
 
+
+# File input keeps a bounded index of identities, never a copy of the transcript.
+# Its absolute deadline belongs to the caller and is shared by every intake step.
+class StreamLimit(ValueError):
+    pass
+
+
+def stream_arguments(parser):
+    parser.add_argument("--file-input")
+    parser.add_argument("--prefix-bytes", type=int)
+    parser.add_argument("--prefix-sha256")
+    parser.add_argument("--deadline-ms", type=int)
+    parser.add_argument("--since")
+    parser.add_argument("--until")
+    parser.add_argument("--boundary-role", choices=("user", "assistant", "system", "developer"))
+
+
+class PrefixSource:
+    def __init__(self, args):
+        import time
+        self.started = time.monotonic()
+        self.path, self.size = args.file_input, args.prefix_bytes
+        self.expected = args.prefix_sha256
+        if not self.path or not os.path.isabs(self.path):
+            raise StreamLimit("explicit-file-required")
+        if not isinstance(self.size, int) or not 0 < self.size <= 1024 * 1024 * 1024:
+            raise StreamLimit("source-limit")
+        if not isinstance(args.deadline_ms, int):
+            raise StreamLimit("absolute-deadline-required")
+        self.deadline = min(self.started + 180, self.started + args.deadline_ms / 1000 - time.time())
+        self.bytes, self.passes, self.records = 0, 0, 0
+        self.sha, self.appended = None, None
+        self.identity = None
+        self.check()
+
+    def check(self):
+        import time
+        if time.monotonic() >= self.deadline:
+            raise StreamLimit("scan-timeout")
+
+    def rows(self):
+        import stat
+        self.check()
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.path, flags)
+        with os.fdopen(fd, "rb") as source:
+            observed = os.fstat(source.fileno())
+            identity = (observed.st_dev, observed.st_ino)
+            if not stat.S_ISREG(observed.st_mode) or observed.st_size < self.size:
+                raise StreamLimit("source-unavailable")
+            if self.identity is not None and identity != self.identity:
+                raise StreamLimit("source-replaced")
+            self.identity = identity
+            sha, offset, ordinal = hashlib.sha256(), 0, 0
+            self.passes += 1
+            while offset < self.size:
+                self.check()
+                raw = source.readline(min(MAX_BYTES + 1, self.size - offset))
+                if not raw:
+                    raise StreamLimit("prefix-short-read")
+                self.bytes += len(raw)
+                if len(raw) > MAX_BYTES:
+                    raise StreamLimit("record-limit")
+                sha.update(raw)
+                start = offset
+                offset += len(raw)
+                if not raw.endswith(b"\n"):
+                    raise StreamLimit("incomplete-record")
+                if not raw.strip():
+                    continue
+                try:
+                    obj = json.loads(raw.decode("utf-8"))
+                    if not isinstance(obj, dict):
+                        raise ValueError("object required")
+                except (UnicodeError, ValueError, RecursionError):
+                    obj = None
+                self.records = ordinal + 1
+                yield ordinal, start, len(raw), obj
+                ordinal += 1
+            after = os.fstat(source.fileno())
+            path_after = os.stat(self.path, follow_symlinks=False)
+            if after.st_size < self.size or (path_after.st_dev, path_after.st_ino) != identity:
+                raise StreamLimit("source-replaced")
+            value = sha.hexdigest()
+            if (self.expected and value != self.expected) or (self.sha and value != self.sha):
+                raise StreamLimit("prefix-changed")
+            self.sha = value
+            self.appended = max(0, after.st_size - self.size)
+            self.records = ordinal
+            self.check()
+
+    def report(self, index=None):
+        import resource
+        import time
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return {"coverage": {"prefix_bytes": self.size, "prefix_sha256": self.sha,
+                             "appended_bytes": self.appended, "complete_source": self.sha is not None and self.appended == 0},
+                "scan": {"bytes": self.bytes, "passes": self.passes,
+                         "elapsed_ms": int((time.monotonic() - self.started) * 1000),
+                         "peak_rss_bytes": int(rss if sys.platform == "darwin" else rss * 1024),
+                         "index_entries": index.entries if index else 0,
+                         "index_bytes": index.bytes if index else 0, "additional_disk_bytes": 0}}
+
+
+def stream_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+
+
+STREAM_FACT_FIELDS = ("codes", "flags", "status", "name", "command", "cwd", "output", "aggregated_output", "stderr", "native_status")
+STREAM_INDEX_ENTRIES = 400000
+STREAM_INDEX_BYTES = 48 * 1024 * 1024
+
+
+class StreamIndex:
+    def __init__(self, closure=True):
+        self.entries, self.bytes = 0, 0
+        from array import array
+        self.closure = closure
+        self.atoms, self.parent, self.records, self.seeds = {}, array("I"), array("Q"), set()
+        self.calls, self.results, self.messages, self.agent_messages = {}, {}, {}, []
+        self.identities = {k: [] for k in ("cwd", "session", "parent_session", "source", "cli_version")}
+        self.invalid, self.child = False, False
+        self.unknown, self.parse_errors, self.unknown_links = 0, 0, 0
+        self.conflicts = 0
+        self.types = {}
+        self.omitted, self.truncated = 0, 0
+
+    def reserve(self, size, entries=1):
+        # This is a logical retained-index budget, not a process RSS limit.
+        # Process high-water memory is reported independently after rendering.
+        if self.entries + entries > STREAM_INDEX_ENTRIES or self.bytes + size > STREAM_INDEX_BYTES:
+            raise StreamLimit("index-limit")
+        self.entries += entries
+        self.bytes += size
+
+    def charge(self, value):
+        self.reserve(256 + len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode()))
+
+    def atom(self, value):
+        # Intern binary SHA256 values once. Maps, facts and graph edges retain
+        # integer handles, rather than repeated hex strings or source bodies.
+        value = bytes.fromhex(stream_digest(value))
+        known = self.atoms.get(value)
+        if known is not None:
+            return known
+        self.reserve(160)
+        identity = len(self.parent)
+        self.atoms[value] = identity
+        self.parent.append(identity)
+        return identity
+
+    def root(self, key):
+        while self.parent[key] != key:
+            self.parent[key] = self.parent[self.parent[key]]
+            key = self.parent[key]
+        return key
+
+    def add_links(self, ordinal, obj, platform, selected):
+        links, missing = record_links(obj, platform)
+        self.unknown_links += missing
+        # Boundary listing still validates every native link, but needs no
+        # range closure graph. Cause/result reconciliation is independent below.
+        if not self.closure:
+            return
+        keys = sorted(self.atom(key) for key in links)
+        if keys:
+            for key in keys[1:]:
+                self.parent[self.root(key)] = self.root(keys[0])
+            self.reserve(8)
+            self.records.append((ordinal << 32) | keys[0])
+            if selected and keys[0] not in self.seeds:
+                self.reserve(40)
+                self.seeds.add(keys[0])
+
+    def add_identity(self, obj):
+        value = full_identity([obj])
+        # Missing identity on an ordinary row is normal. Invalid types are not.
+        raw = obj.get("payload", {}) if obj.get("type") in ("session_meta", "turn_context") else obj
+        if not isinstance(raw, dict):
+            self.invalid = True
+        else:
+            for field in ("cwd", "sessionId", "parent_session_id", "parentSessionId", "cli_version", "version"):
+                if field in raw and not (field in ("parent_session_id", "parentSessionId") and raw[field] is None):
+                    self.invalid |= not isinstance(raw[field], str) or not raw[field]
+            if obj.get("type") == "session_meta":
+                self.invalid |= not isinstance(raw.get("id"), str) or not raw.get("id")
+            if "source" in raw:
+                source = raw["source"]
+                self.invalid |= not isinstance(source, (str, dict)) or not source
+                if isinstance(source, dict):
+                    self.invalid |= set(source) != {"subagent"}
+                    subagent = source.get("subagent")
+                    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+                    if isinstance(spawn, dict) and "parent_thread_id" in spawn:
+                        self.invalid |= not isinstance(spawn["parent_thread_id"], str) or not spawn["parent_thread_id"]
+            if "isSidechain" in obj:
+                self.invalid |= not isinstance(obj["isSidechain"], bool)
+        self.child |= value["child_context"]
+        for key in self.identities:
+            for v in value[key]:
+                if v not in self.identities[key]:
+                    self.charge([key, v])
+                    self.identities[key].append(v)
+
+    def message(self, identity, signature):
+        key = bytes.fromhex(stream_digest(identity))
+        if key not in self.messages:
+            self.reserve(160)
+            self.messages[key] = signature
+        elif self.messages[key] != signature:
+            self.conflicts += 1
+
+    def add(self, obj, platform):
+        self.add_identity(obj)
+        _, diag = prepare_records([obj], platform)
+        self.conflicts += diag["identity_conflicts"] - sum(len(diag["full_identity"][k]) > 1 for k in self.identities)
+        self.unknown += diag["unknown_records"]
+        for key, value in diag["unknown_record_types"].items():
+            self.types[key if key in self.types or len(self.types) < 31 else "other"] = self.types.get(key, 0) + value
+        self.omitted += diag["omitted"]
+        self.truncated += diag["truncated"]
+        p = completed_item(obj).get("payload", {})
+        if platform == "codex" and isinstance(p, dict):
+            kind = p.get("type")
+            if kind == "message" and obj.get("type") == "response_item":
+                signature = self.atom([p.get("role"), message_text(p.get("content"))])
+                if p.get("id"):
+                    self.message(["message", p["id"]], signature)
+                    self.message(["canonical-record", p["id"]], self.atom(obj))
+                if obj.get("timestamp"):
+                    self.message(["alias", p.get("role"), obj["timestamp"], message_text(p.get("content"))], signature)
+            elif kind == "user_message" and isinstance(p.get("id"), str):
+                self.message(["message", p["id"]], self.atom(["user", p.get("message")]))
+            elif kind == "item_completed" and isinstance(p.get("item"), dict) and p["item"].get("type") == "AgentMessage":
+                item = p["item"]
+                candidates = []
+                for content in [item[k] for k in ("text", "content") if k in item]:
+                    if isinstance(content, list):
+                        content = [{**b, "type": "output_text"} if isinstance(b, dict) and b.get("type") == "Text" else b for b in content]
+                    text = message_text(content)
+                    candidates.append((bytes.fromhex(stream_digest(["message", item.get("id")])), bytes.fromhex(stream_digest(["alias", "assistant", obj.get("timestamp"), text])), self.atom(["assistant", text])) if text else (None, None, -1))
+                self.reserve(48 + 176 * len(candidates))
+                self.agent_messages.append(candidates)
+            if obj.get("type") == "response_item" and kind in ("function_call", "custom_tool_call"):
+                identity = p.get("call_id")
+                if not isinstance(identity, str) or not identity:
+                    self.unknown_links += 1
+                    return
+                key = self.atom(("tool", identity))
+                arguments = p.get("arguments", p.get("input", {}))
+                if isinstance(arguments, str):
+                    try: arguments = json.loads(arguments)
+                    except ValueError: arguments = {}
+                arguments = arguments if isinstance(arguments, dict) else {}
+                command = arguments.get("cmd", arguments.get("command"))
+                if isinstance(command, list): command = command[-1] if command else None
+                value = (self.atom(p), tuple(self.atom(arguments[k]) for k in ("workdir", "cwd") if isinstance(arguments.get(k), str)), self.atom(command) if command else None)
+                if key in self.calls and self.calls[key] != value: self.conflicts += 1
+                elif key not in self.calls:
+                    self.reserve(128); self.calls[key] = value
+            elif ((obj.get("type") == "response_item" and kind in ("function_call_output", "custom_tool_call_output"))
+                  or (obj.get("type") == "event_msg" and kind == "exec_command_end")):
+                identity = p.get("call_id")
+                if not isinstance(identity, str) or not identity:
+                    self.unknown_links += 1
+                    return
+                key = self.atom(("tool", identity))
+                facts = tool_facts(p)
+                fields = {k: self.atom(v) for k, v in facts.items() if k != "omitted" and not (k in ("codes", "flags") and not v) and not (k == "status" and v == "unknown")}
+                if key not in self.results:
+                    from array import array
+                    self.reserve(160)
+                    self.results[key] = array("q", [-1] * len(STREAM_FACT_FIELDS) + [0])
+                group = self.results[key]
+                group[-1] |= int(kind != "exec_command_end" or p.get("requires_association", False))
+                for k, value in fields.items():
+                    at = STREAM_FACT_FIELDS.index(k)
+                    if group[at] == -1: group[at] = value
+                    elif group[at] != value: self.conflicts += 1
+        elif platform == "claude":
+            if isinstance(obj.get("uuid"), str) and obj["uuid"]:
+                self.message(["record", obj["uuid"]], self.atom(obj))
+            msg = obj.get("message", {})
+            content = msg.get("content", []) if isinstance(msg, dict) else []
+            for b in content if isinstance(content, list) else []:
+                if not isinstance(b, dict) or b.get("type") not in ("tool_use", "tool_result"): continue
+                identity = b.get("id" if b["type"] == "tool_use" else "tool_use_id")
+                if not isinstance(identity, str) or not identity:
+                    self.unknown_links += 1; continue
+                key = self.atom(("tool", identity))
+                table = self.calls if b["type"] == "tool_use" else self.results
+                value = self.atom(b)
+                if key in table and table[key] != value: self.conflicts += 1
+                elif key not in table:
+                    self.reserve(80); table[key] = value
+
+    def finish(self, platform):
+        if platform == "codex":
+            for key, group in self.results.items():
+                call = self.calls.get(key, (None, (), None))
+                cwds = set(call[1])
+                cwd, command = group[STREAM_FACT_FIELDS.index("cwd")], group[STREAM_FACT_FIELDS.index("command")]
+                if cwd != -1: cwds.add(cwd)
+                self.conflicts += int(len(cwds) > 1)
+                if call[2] is not None and command != -1 and call[2] != command:
+                    self.conflicts += 1
+            for candidates in self.agent_messages:
+                if candidates and all(self.messages.get(mid) == sig or self.messages.get(alias) == sig for mid, alias, sig in candidates):
+                    self.omitted -= 1
+        missing = any(not self.identities[k] for k in ("cwd", "session"))
+        identity = {**self.identities, "child_context": bool(self.child or self.identities["parent_session"]), "metadata_missing": missing,
+                    "invalid": bool(self.invalid or missing or (self.child and not self.identities["parent_session"]))}
+        conflicts = self.conflicts + sum(len(v) > 1 for v in self.identities.values())
+        unmatched_results = sum(k not in self.calls and (platform == "claude" or v[-1]) for k, v in self.results.items())
+        return {"unsupported": platform not in ("claude", "codex"), "identity_conflicts": conflicts, "unknown_records": self.unknown,
+                "unmatched_calls": len(set(self.calls) - set(self.results)), "unmatched_results": unmatched_results,
+                "parse_errors": self.parse_errors, "unknown_links": self.unknown_links + int(identity["invalid"]),
+                "selection_errors": 0, "metadata_missing": missing}, identity
+
+
+def stream_failure(reason, source=None, index=None):
+    diag = {"platform": "unknown", "unsupported": True, "unknown_records": 1, "omitted": 0, "truncated": 0,
+            "identity_conflicts": 0, "unmatched_calls": 0, "unmatched_results": 0, "unknown_results": 0,
+            "tool_observations": [], "unknown_record_types": {}, "parse_errors": 0, "incomplete_reason": reason,
+            "full_identity": {"cwd": [], "session": [], "parent_session": [], "source": [], "cli_version": [],
+                              "invalid": True, "metadata_missing": True, "child_context": False}}
+    diag["global"] = {k: diag[k] for k in ("unsupported", "unknown_records", "identity_conflicts", "unmatched_calls", "unmatched_results", "parse_errors")}
+    diag["global"].update(unknown_links=1, selection_errors=1, metadata_missing=True)
+    if source:
+        diag.update(source.report(index))
+        diag["coverage"].update(complete_source=False, appended_bytes=None)
+    return {"platform": "unknown", "objects": [], "boundaries": [], "meta": diag, "lines": source.records if source else 0}
+
+
+def stream_window(args):
+    import datetime
+    source, index = None, StreamIndex(closure=not getattr(args, "boundaries_json", False))
+    try:
+        source = PrefixSource(args)
+        import re
+        if not isinstance(args.prefix_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", args.prefix_sha256):
+            raise StreamLimit("prefix-hash-required")
+        boundaries = getattr(args, "boundaries_json", False)
+        if not boundaries and not (args.start_record and args.end_record):
+            raise StreamLimit("explicit-window-required")
+        def instant(value):
+            if value is None: return None
+            return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        since, until = instant(args.since), instant(args.until)
+        if since is not None and until is not None and since > until: raise StreamLimit("invalid-period")
+        platform, first, last, start_count, end_count = None, None, None, 0, 0
+        headers, eligible, rows_count = [], 0, 0
+        for ordinal, offset, length, obj in source.rows():
+            rows_count += 1
+            if obj is None:
+                index.parse_errors += 1; continue
+            if platform is None:
+                if obj.get("type") in ("session_meta", "turn_context", "response_item", "event_msg"): platform = "codex"
+                elif obj.get("type") in ("user", "assistant"): platform = "claude"
+            if platform is None: raise StreamLimit("unsupported-leading-record")
+            fp = record_fingerprint(obj)
+            if fp in (args.start_record, args.end_record):
+                stamp = instant(obj.get("timestamp"))
+                if stamp is None or (since is not None and stamp < since) or (until is not None and stamp > until):
+                    raise StreamLimit("boundary-outside-period")
+            if fp == args.start_record:
+                start_count += 1
+                if first is None: first = ordinal
+            if fp == args.end_record:
+                end_count += 1
+                if last is None: last = ordinal
+            selected = first is not None and ordinal >= first and (last is None or ordinal <= last)
+            index.add_links(ordinal, obj, platform, selected)
+            index.add(obj, platform)
+            if boundaries:
+                h = boundary_headers([obj])[0]
+                stamp = instant(h.get("timestamp"))
+                if ((since is None or stamp is not None and stamp >= since) and (until is None or stamp is not None and stamp <= until)
+                        and (args.boundary_role is None or h.get("role") == args.boundary_role)):
+                    eligible += 1
+                    if len(headers) < 1000: headers.append(h)
+        global_diag, identity = index.finish(platform)
+        if boundaries:
+            _, diag = prepare_records([], platform)
+            diag.update(global_diag, full_identity=identity)
+            diag.update(omitted=index.omitted, truncated=index.truncated, unknown_record_types=index.types)
+            diag["global"] = global_diag
+            diag["boundaries"] = {"total": eligible, "returned": len(headers), "truncated": max(0, eligible - 1000), "source_records": rows_count}
+            diag.update(source.report(index))
+            return {"platform": platform, "objects": [], "boundaries": headers, "meta": diag, "lines": rows_count}
+        if start_count != 1 or end_count != 1 or first > last:
+            raise StreamLimit("boundary-not-unique-or-ordered")
+        roots = {index.root(k) for k in index.seeds}
+        selected_ordinals = {value >> 32 for value in index.records if index.root(value & 0xffffffff) in roots}
+        # The first-pass index has served closure/global validation. Release its
+        # containers before the second-pass outside accumulator is populated.
+        for table in (index.atoms, index.calls, index.results, index.messages, index.agent_messages, index.seeds):
+            table.clear()
+        del index.parent[:]
+        del index.records[:]
+        chosen, chosen_bytes, selected_count = [], 0, 0
+        outside = StreamIndex(closure=False)
+        for ordinal, offset, length, obj in source.rows():
+            if obj is None: continue
+            if first <= ordinal <= last or ordinal in selected_ordinals:
+                chosen_bytes += length
+                if chosen_bytes > MAX_BYTES: raise StreamLimit("selection-limit")
+                chosen.append(obj); selected_count += 1
+            else:
+                outside.add(obj, platform)
+        normalized, diag = prepare_records(chosen, platform)
+        outside_global, _ = outside.finish(platform)
+        diag["outside"] = {**outside_global, "omitted": outside.omitted, "truncated": outside.truncated,
+                           "unknown_record_types": outside.types, "unknown_results": 0}
+        diag["full_identity"] = identity
+        diag["global"] = global_diag
+        for key in ("identity_conflicts", "unknown_records", "unmatched_calls", "unmatched_results"):
+            diag[key] = max(diag[key], global_diag[key])
+        diag["unknown_records"] += global_diag["unknown_links"]
+        diag["parse_errors"] = global_diag["parse_errors"]
+        diag["selection"] = {"mode": "window", "start_record": args.start_record, "end_record": args.end_record,
+                             "valid": True, "reason": None, "total_records": rows_count, "range_records": last - first + 1,
+                             "selected_records": selected_count, "closure_records": selected_count - (last - first + 1),
+                             "outside_records": rows_count - selected_count, "complete_session": False}
+        diag.update(source.report(index if index.bytes >= outside.bytes else outside))
+        return {"platform": platform, "objects": normalized, "meta": diag, "lines": rows_count}
+    except (ValueError, OSError, UnicodeError, TypeError, RecursionError) as error:
+        reason = str(error) if isinstance(error, StreamLimit) else "invalid-stream-input"
+        return stream_failure(reason, source, index)
+
+
+def stream_metadata(args):
+    source = None
+    try:
+        source = PrefixSource(args)
+        lines, tail, head_bytes = [], [], 0
+        for ordinal, offset, length, obj in source.rows():
+            if obj is None: raise StreamLimit("malformed-record")
+            encoded = json.dumps(obj)
+            if len(lines) < MAX_LINES:
+                head_bytes += len(encoded.encode())
+                if head_bytes > MAX_BYTES: raise StreamLimit("metadata-head-limit")
+                lines.append(encoded)
+            # Retain only timestamps, never trailing message bodies.
+            stamp = obj.get("timestamp")
+            if isinstance(stamp, str): tail = [(offset, stamp)]
+        result = extract_from_lines(lines) or {"platform": "unknown"}
+        result.update(reader_metadata(lines))
+        for key in ("source", "cli_version"):
+            if len(result["identities"][key]) == 1: result[key] = result["identities"][key][0]
+        result.update(file=source.path, size=source.size, oversized=False)
+        if tail and tail[0][0] >= max(0, source.size - TAIL_BYTES): result["last_ts"] = tail[0][1]
+        report = source.report()
+        return {"sessions": [result], "meta": {"files_processed": 1, "parse_errors": 0, **report}}
+    except (ValueError, OSError, UnicodeError, TypeError, RecursionError) as error:
+        reason = str(error) if isinstance(error, StreamLimit) else "invalid-stream-input"
+        return {"sessions": [], "meta": {"files_processed": 1, "parse_errors": 1, "incomplete_reason": reason, **(source.report() if source else {})}}
+
+
+def bounded_json(value):
+    import resource
+    encoded = json.dumps(value)
+    oversized = len(encoded.encode()) > MAX_BYTES
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    rss = int(rss if sys.platform == "darwin" else rss * 1024)
+    observed = value.get("meta", {}).get("scan")
+    if observed is not None:
+        observed["peak_rss_bytes"] = max(observed["peak_rss_bytes"], rss)
+    if oversized:
+        failure = stream_failure("output-limit")
+        if observed is not None: failure["meta"]["scan"] = observed
+        value = {"text": "", "boundaries": [], "meta": failure["meta"]}
+    del encoded
+    encoded = json.dumps(value)
+    if len(encoded.encode()) > MAX_BYTES:
+        failure = stream_failure("output-limit")
+        if observed is not None: failure["meta"]["scan"] = observed
+        return json.dumps({"text": "", "boundaries": [], "meta": failure["meta"]})
+    return encoded
+
+
 def main():
     # Parse arguments: files and optional --cwd-filter / --keyword
     files = []
@@ -1181,6 +1722,13 @@ def main():
 
 
 if __name__ == "__main__":
+    if "--file-input" in sys.argv:
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--json", action="store_true", required=True)
+        stream_arguments(parser)
+        print(bounded_json(stream_metadata(parser.parse_args())))
+        sys.exit(0)
     if "--json" in sys.argv:
         import io
         original = sys.stdout

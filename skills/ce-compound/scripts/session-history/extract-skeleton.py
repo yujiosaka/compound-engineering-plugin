@@ -39,7 +39,12 @@ parser.add_argument("--json", action="store_true", help="Emit one JSON object wi
 parser.add_argument("--start-record", help="Inclusive canonical record SHA256; requires --end-record and --json.")
 parser.add_argument("--end-record", help="Inclusive canonical record SHA256; requires --start-record and --json.")
 parser.add_argument("--boundaries-json", action="store_true", help="Emit at most 1000 body-free native boundary headers.")
+import runpy
+shared = runpy.run_path(os.path.join(os.path.dirname(__file__), "extract-metadata.py"))
+shared["stream_arguments"](parser)
 args = parser.parse_args()
+if args.file_input and not args.json and not getattr(args, "boundaries_json", False):
+    parser.error("file input requires --json")
 if (args.start_record is None) != (args.end_record is None):
     parser.error("--start-record and --end-record are required together")
 if args.start_record is not None and not args.json:
@@ -50,8 +55,6 @@ if args.boundaries_json:
     args.json = True
 if args.json and args.output:
     parser.error("--json and --output are mutually exclusive")
-import runpy
-shared = runpy.run_path(os.path.join(os.path.dirname(__file__), "extract-metadata.py"))
 
 # Session logs are UTF-8; force UTF-8 I/O so Windows' cp1252 default can't crash
 # on non-Latin-1 content like emoji, smart quotes, or box-drawing (#1258).
@@ -506,70 +509,82 @@ def handle_cursor(obj):
                 pending_tools.append({"ts": "", "name": name, "target": target})
 
 
-# Auto-detect platform from first few lines, then process all
-detected = None
-buffer = []
-# omp files physically begin with a fixed-width type:'title' slot line before
-# the pi-shaped type:'session' header; bare pi files start with the header.
-seen_title_slot = False
-
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    buffer.append(line)
-    stats["lines"] += 1
-
-    # Scan until a decisive record appears (short-circuits once detected).
-    # Claude Code sessions front-load 10+ non-message metadata records
-    # (last-prompt, custom-title, attachments, ...), so capping detection to
-    # the first N lines silently misroutes them to the codex handler and
-    # produces an empty skeleton with parse_errors: 0 (issue #923).
-    if not detected:
-        try:
-            obj = json.loads(line)
-            if obj.get("type") == "session" and "cwd" in obj:
-                detected = "omp" if seen_title_slot else "pi"
-            elif obj.get("type") == "title" and len(buffer) == 1:
-                seen_title_slot = True
-            elif obj.get("type") in ("user", "assistant"):
-                detected = "claude"
-            elif obj.get("type") in ("session_meta", "turn_context", "response_item", "event_msg"):
-                detected = "codex"
-            elif obj.get("role") in ("user", "assistant") and "type" not in obj:
-                detected = "cursor"
-        except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
-            pass
-
-handlers = {"claude": handle_claude, "codex": handle_codex, "cursor": handle_cursor, "pi": handle_pi, "omp": handle_pi}
-handler = handlers.get(detected, handle_codex)
-
-objects = []
-for line in buffer:
-    try:
-        value = json.loads(line)
-        if not isinstance(value, dict):
-            raise TypeError("object required")
-        objects.append(value)
-    except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
-        stats["parse_errors"] += 1
-
-if detected in ("pi", "omp"):
-    objects = _pi_context_objects(objects)
-
-if args.boundaries_json:
-    boundaries, diagnostics = shared["prepare_window"](objects, detected, None, None, stats["parse_errors"], boundaries=True)
+if args.file_input:
+    result = shared["stream_window"](args)
+    detected, objects, diagnostics = result["platform"], result["objects"], result["meta"]
+    stats["lines"] = result["lines"]
     stats.update(diagnostics)
-    sys.stdout = _original_stdout
-    print(json.dumps({"boundaries": boundaries, "meta": {"_meta": True, **stats}}))
-    sys.exit(0)
-if args.start_record is not None:
-    objects, diagnostics = shared["prepare_window"](objects, detected, args.start_record, args.end_record, stats["parse_errors"])
+    if getattr(args, "boundaries_json", False):
+        sys.stdout = _original_stdout
+        print(shared["bounded_json"]({"boundaries": result["boundaries"], "meta": {"_meta": True, **stats}}))
+        sys.exit(0)
+    handler = {"claude": handle_claude, "codex": handle_codex}.get(detected, lambda obj: None)
 else:
-    objects, diagnostics = shared["prepare_records"](objects, detected)
-    if detected in ("claude", "codex") and diagnostics["full_identity"]["invalid"]:
-        diagnostics["unknown_records"] += 1
-stats.update(diagnostics)
+    # Auto-detect platform from first few lines, then process all
+    detected = None
+    buffer = []
+    # omp files physically begin with a fixed-width type:'title' slot line before
+    # the pi-shaped type:'session' header; bare pi files start with the header.
+    seen_title_slot = False
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        buffer.append(line)
+        stats["lines"] += 1
+
+        # Scan until a decisive record appears (short-circuits once detected).
+        # Claude Code sessions front-load 10+ non-message metadata records
+        # (last-prompt, custom-title, attachments, ...), so capping detection to
+        # the first N lines silently misroutes them to the codex handler and
+        # produces an empty skeleton with parse_errors: 0 (issue #923).
+        if not detected:
+            try:
+                obj = json.loads(line)
+                if obj.get("type") == "session" and "cwd" in obj:
+                    detected = "omp" if seen_title_slot else "pi"
+                elif obj.get("type") == "title" and len(buffer) == 1:
+                    seen_title_slot = True
+                elif obj.get("type") in ("user", "assistant"):
+                    detected = "claude"
+                elif obj.get("type") in ("session_meta", "turn_context", "response_item", "event_msg"):
+                    detected = "codex"
+                elif obj.get("role") in ("user", "assistant") and "type" not in obj:
+                    detected = "cursor"
+            except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
+                pass
+
+    handlers = {"claude": handle_claude, "codex": handle_codex, "cursor": handle_cursor, "pi": handle_pi, "omp": handle_pi}
+    handler = handlers.get(detected, handle_codex)
+
+    objects = []
+    for line in buffer:
+        try:
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise TypeError("object required")
+            objects.append(value)
+        except (json.JSONDecodeError, KeyError, AttributeError, TypeError):
+            stats["parse_errors"] += 1
+
+    if detected in ("pi", "omp"):
+        objects = _pi_context_objects(objects)
+
+    if args.boundaries_json:
+        boundaries, diagnostics = shared["prepare_window"](objects, detected, None, None, stats["parse_errors"], boundaries=True)
+        stats.update(diagnostics)
+        sys.stdout = _original_stdout
+        print(json.dumps({"boundaries": boundaries, "meta": {"_meta": True, **stats}}))
+        sys.exit(0)
+    if args.start_record is not None:
+        objects, diagnostics = shared["prepare_window"](objects, detected, args.start_record, args.end_record, stats["parse_errors"])
+    else:
+        objects, diagnostics = shared["prepare_records"](objects, detected)
+        if detected in ("claude", "codex") and diagnostics["full_identity"]["invalid"]:
+            diagnostics["unknown_records"] += 1
+    stats.update(diagnostics)
+
 
 for obj in objects:
     try:
@@ -594,4 +609,4 @@ if args.json:
     body = sys.stdout.getvalue()
     sys.stdout = _original_stdout
     text = "\n".join(body.splitlines()[:-1])
-    print(json.dumps({"text": text, "meta": {"_meta": True, **stats}}))
+    print(shared["bounded_json"]({"text": text, "meta": {"_meta": True, **stats}}))
