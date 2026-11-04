@@ -59,23 +59,23 @@ describe("native result grammar and explicit incomplete evidence", () => {
     const out = await run("extract-skeleton.py", [meta, row("response_item", { type: "message", role: "user", content: [{ type: "input_text", text: "Again" }] }), { ...row("event_msg", { type: "user_message", message: "Again" }), timestamp: "2025-01-01T00:01:00Z" }])
     expect(out.meta.user).toBe(2)
   })
-  test("native completed execution keeps cwd and failure while unknown association stays pending", async () => {
+  test("native completed execution keeps its own identity, cwd and failure", async () => {
     const completed = (id: string, code: number) => row("event_msg", { type: "item_completed", item: { type: "CommandExecution", id, cwd, exit_code: code, command: "check synthetic", aggregated_output: "synthetic output", status: code ? "failed" : "completed" } })
     const rows = [meta, completed("native-failed", 1), completed("native-passed", 0)]
     const out = await run("extract-skeleton.py", rows)
     expect(out.meta.tool).toBe(2)
-    expect(out.meta.unmatched_results).toBe(2)
+    expect(out.meta.unmatched_results).toBe(0)
     expect(out.meta.tool_observations.map((o: any) => [o.executed_cwd, o.status])).toEqual([[cwd, "error"], [cwd, "ok"]])
     expect((await run("extract-errors.py", rows)).meta.errors_found).toBe(1)
     const aliased = await run("extract-skeleton.py", [meta, call("same"), result("same", { exit_code: 0 }), completed("same", 0)])
-    expect(aliased.meta.tool).toBe(1)
+    expect(aliased.meta.tool).toBe(2)
     expect(aliased.meta.unmatched_results).toBe(0)
     const nativeTools = await run("extract-skeleton.py", [meta, ...["McpToolCall", "FileChange"].map(type => row("event_msg", { type: "item_completed", item: { type, id: type, status: "failed", result: { isError: true } } }))])
     expect(nativeTools.meta.tool).toBe(2)
-    expect(nativeTools.meta.unmatched_results).toBe(2)
+    expect(nativeTools.meta.unmatched_results).toBe(0)
     expect(nativeTools.meta.tool_observations.every((o: any) => o.status === "error")).toBe(true)
     const supplemental = await run("extract-skeleton.py", [meta, call("same"), result("same", "command response"), completed("same", 0)])
-    expect(supplemental.meta.tool_observations[0].status).toBe("ok")
+    expect(supplemental.meta.tool_observations.map((o: any) => o.status)).toEqual(["unknown", "ok"])
     const metadata = await run("extract-skeleton.py", [meta, row("response_item", { type: "additional_tools", tools: [] }), row("event_msg", { type: "thread_settings_applied" }), ...["world_state", "inter_agent_communication_metadata", "token_usage_record"].map(type => row(type, {})), ...["Reasoning", "SubAgentActivity"].map(type => row("event_msg", { type: "item_completed", item: { type } }))])
     expect(metadata.meta.unknown_records).toBe(0)
     expect(metadata.meta.tool).toBe(0)
@@ -88,8 +88,8 @@ describe("native result grammar and explicit incomplete evidence", () => {
       for (const canonical of [[], [result("same", { exit_code: 0 })]]) {
         const rows = [meta, call("same"), ...canonical, ...aliases]
         const skeleton = await run("extract-skeleton.py", rows)
-        expect(skeleton.meta.tool).toBe(1)
-        expect(skeleton.meta.tool_observations[0].status).toBe("error")
+        expect(skeleton.meta.tool).toBe(canonical.length ? 2 : 1)
+        expect(skeleton.meta.tool_observations.find((o: any) => o.native_item_id === "same").status).toBe("error")
         expect(skeleton.meta.identity_conflicts).toBeGreaterThan(0)
         expect((await run("extract-errors.py", rows)).meta.errors_found).toBe(1)
       }

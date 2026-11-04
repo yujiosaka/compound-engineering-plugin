@@ -553,7 +553,8 @@ def known_completed_user(obj):
     if not known_completed_envelope(obj):
         return False
     item = obj["payload"]["item"]
-    return (isinstance(item, dict) and set(item) == {"type", "id", "content"} and item["type"] == "UserMessage"
+    return (isinstance(item, dict) and {"type", "id", "content"} <= set(item) <= {"type", "id", "content", "client_id"} and item["type"] == "UserMessage"
+            and ("client_id" not in item or isinstance(item["client_id"], str) and bool(item["client_id"]))
             and isinstance(item["id"], str) and bool(item["id"]) and isinstance(item["content"], list)
             and all(isinstance(b, dict) and set(b) == {"type", "text", "text_elements"}
                     and b["type"] == "text" and isinstance(b["text"], str) and b["text_elements"] == [] for b in item["content"]))
@@ -568,26 +569,86 @@ def known_web_extension(obj):
             or not all(isinstance(item[key], str) for key in ("id", "query")) or not item["id"]):
         return False
     action = item["action"]
-    if not isinstance(action, dict) or set(action) != {"type", "url"} or action["type"] != "openPage" or not isinstance(action["url"], str):
+    if not isinstance(action, dict):
         return False
-    fields = {"type", "domain", "ref_id", "snippet", "title", "url"}
-    return isinstance(item["results"], list) and all(isinstance(r, dict) and fields <= set(r) <= fields | {"thumbnail_url"}
+    valid_action = ((set(action) == {"type", "url"} and action["type"] == "openPage" and isinstance(action["url"], str))
+                    or (set(action) == {"type", "pattern", "url"} and action["type"] == "findInPage" and isinstance(action["pattern"], str) and (action["url"] is None or isinstance(action["url"], str)))
+                    or (set(action) == {"type", "query", "queries"} and action["type"] == "search" and isinstance(action["query"], str) and action["queries"] is None))
+    if not valid_action:
+        return False
+    fields = {"type", "domain", "ref_id", "snippet", "url"}
+    return isinstance(item["results"], list) and all(isinstance(r, dict) and fields <= set(r) <= fields | {"title", "thumbnail_url"}
             and r["type"] == "text_result" and all(isinstance(v, str) for v in r.values()) for r in item["results"])
 
 
-def completed_item(obj):
-    """Keep native execution evidence without guessing its outer tool call."""
+def known_native_extra(obj):
+    if not known_completed_envelope(obj):
+        return False
+    item = obj["payload"]["item"]
+    if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
+        return False
+    kind = item.get("type")
+    if kind == "Extension":
+        return (set(item) == {"type", "kind", "id", "durationMs"} and item["kind"] == "clock.sleep"
+                and isinstance(item["durationMs"], int) and not isinstance(item["durationMs"], bool) and item["durationMs"] >= 0)
+    if kind == "ImageView":
+        return set(item) == {"type", "id", "path"} and isinstance(item["path"], str) and bool(item["path"])
+    if kind == "FunctionCallOutput":
+        return (set(item) == {"type", "id", "name", "namespace", "output"}
+                and all(isinstance(item[k], str) and item[k] for k in ("name", "namespace"))
+                and isinstance(item["output"], (str, dict, list)))
+    if kind == "CollabAgentToolCall":
+        # Empty native wait snapshots are observed. Populated child state is not
+        # inferred from another platform's schema and remains unsupported.
+        return (set(item) == {"type", "id", "tool", "status", "sender_thread_id", "receiver_thread_ids", "receiver_agents", "agents_states"}
+                and item["tool"] == "wait" and item["status"] in ("completed", "failed")
+                and isinstance(item["sender_thread_id"], str) and item["sender_thread_id"] == obj["payload"]["thread_id"]
+                and item["receiver_thread_ids"] == [] and item["receiver_agents"] == [] and item["agents_states"] == {})
+    return False
+
+
+def native_output_metadata(value):
+    import math
+    if value is None:
+        return True
+    if not (isinstance(value, dict) and set(value) == {"turn_id", "create_time"}
+            and isinstance(value["turn_id"], str) and value["turn_id"]
+            and isinstance(value["create_time"], (int, float)) and not isinstance(value["create_time"], bool)):
+        return False
+    try:
+        return math.isfinite(value["create_time"]) and value["create_time"] >= 0
+    except OverflowError:
+        return False
+
+
+def native_output(obj):
     p = obj.get("payload", {})
+    return (obj.get("type") == "response_item" and isinstance(p, dict)
+            and p.get("type") in ("function_call_output", "custom_tool_call_output") and "call_id" not in p
+            and {"type", "id", "name", "namespace", "output"} <= set(p) <= {"type", "id", "name", "namespace", "output", "internal_chat_message_metadata_passthrough"}
+            and all(isinstance(p[k], str) and p[k] for k in ("id", "name", "namespace"))
+            and isinstance(p["output"], (str, dict, list))
+            and native_output_metadata(p.get("internal_chat_message_metadata_passthrough")))
+
+
+def completed_item(obj):
+    """Keep native item identity distinct from an outer function call ID."""
+    p = obj.get("payload", {})
+    if native_output(obj):
+        return {**obj, "type": "event_msg", "payload": {**p, "type": "exec_command_end", "_reader_native_item": (p["id"],),
+                "native_turn_id": (p.get("internal_chat_message_metadata_passthrough") or {}).get("turn_id")}}
     if obj.get("type") != "event_msg" or not isinstance(p, dict) or p.get("type") != "item_completed":
         return obj
     item = p.get("item", {})
     if known_completed_user(obj):
         return {**obj, "payload": {"type": "user_message", "id": item["id"], "message": message_text(item["content"])}}
-    if not isinstance(item, dict) or item.get("type") not in ("CommandExecution", "McpToolCall", "FileChange"):
+    if not isinstance(item, dict):
         return obj
-    result = {"type": "exec_command_end", "call_id": item.get("id"), "requires_association": True,
-              "name": item.get("tool") if isinstance(item.get("tool"), str) else item["type"]}
-    for source, target in (("status", "native_status"), ("cwd", "cwd"), ("command", "command"), ("result", "output"), ("stderr", "stderr")):
+    if item.get("type") not in ("CommandExecution", "McpToolCall", "FileChange") and not (known_native_extra(obj) and item["type"] in ("FunctionCallOutput", "CollabAgentToolCall")):
+        return obj
+    result = {"type": "exec_command_end", "_reader_native_item": (item.get("id"),),
+              "name": item.get("tool", item.get("name", item["type"])), "native_turn_id": p.get("turn_id")}
+    for source, target in (("status", "native_status"), ("cwd", "cwd"), ("command", "command"), ("result", "output"), ("output", "output"), ("stderr", "stderr"), ("namespace", "namespace")):
         if source in item:
             result[target] = item[source]
     if "aggregated_output" in item or "stdout" in item:
@@ -596,7 +657,32 @@ def completed_item(obj):
         result["exit_code"] = item["exit_code"]
     if item.get("status") == "failed":
         result["is_error"] = True
+    if item.get("type") == "CollabAgentToolCall":
+        result["output"] = item
     return {**obj, "payload": result}
+
+
+def tool_identity(payload):
+    native = payload.get("_reader_native_item")
+    value = native[0] if isinstance(native, tuple) and len(native) == 1 else payload.get("call_id")
+    return ("native" if isinstance(native, tuple) else "tool", value) if isinstance(value, str) and value else None
+
+
+def comparable_mcp_output(value):
+    """Normalize only observed text-only MCP renderings, retaining wrapper facts."""
+    import re
+    if isinstance(value, dict) and {"content"} <= set(value) <= {"content", "isError", "_meta"}:
+        content = value["content"]
+        if (("isError" not in value or isinstance(value["isError"], bool))
+                and ("_meta" not in value or isinstance(value["_meta"], dict))
+                and isinstance(content, list)
+                and all(isinstance(b, dict) and set(b) == {"type", "text"} and b["type"] == "text" and isinstance(b["text"], str) for b in content)):
+            return content, {"mcp_meta": value["_meta"]} if "_meta" in value else {}
+    if (isinstance(value, list) and len(value) > 1
+            and all(isinstance(b, dict) and set(b) == {"type", "text"} and b["type"] == "input_text" and isinstance(b["text"], str) for b in value)
+            and re.fullmatch(r"Wall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:", value[0]["text"])):
+        return [{"type": "text", "text": b["text"]} for b in value[1:]], {}
+    return value, {}
 
 
 def tool_facts(payload):
@@ -608,13 +694,16 @@ def tool_facts(payload):
     if isinstance(command, list):
         command = command[-1] if command else None
     facts = {"codes": sorted(set(codes)), "flags": sorted(set(flags)), "omitted": omitted + legacy_omitted}
-    for key, value in (("name", payload.get("name")), ("command", command), ("cwd", payload.get("cwd")), ("output", payload.get("output")), ("aggregated_output", payload.get("aggregated_output")), ("stderr", payload.get("stderr")), ("native_status", payload.get("native_status"))):
+    for key, value in (("name", payload.get("name")), ("command", command), ("cwd", payload.get("cwd")), ("output", payload.get("output")), ("aggregated_output", payload.get("aggregated_output")), ("stderr", payload.get("stderr")), ("native_status", payload.get("native_status")), ("namespace", payload.get("namespace")), ("native_turn_id", payload.get("native_turn_id")), ("native_metadata", payload.get("internal_chat_message_metadata_passthrough"))):
         if value is not None and (value != "" or key in ("output", "aggregated_output", "stderr")):
-            if isinstance(value, str):
+            if isinstance(value, str) and key not in ("namespace", "native_turn_id"):
                 try:
                     value = json.loads(value)
                 except ValueError:
                     pass
+            if key == "output":
+                value, extra = comparable_mcp_output(value)
+                facts.update(extra)
             facts[key] = value
     facts["status"] = "error" if any(c != 0 for c in codes) or True in flags else ("ok" if codes or flags else "unknown")
     return facts
@@ -628,8 +717,7 @@ def codex_records(objects, diagnostics):
         p = obj.get("payload", {})
         if not isinstance(p, dict):
             continue
-        kind, identity = p.get("type"), p.get("call_id")
-        identity = identity if isinstance(identity, str) and identity else None
+        kind, identity = p.get("type"), tool_identity(p)
         if obj.get("type") == "response_item" and kind in ("function_call", "custom_tool_call"):
             if not identity:
                 diagnostics["unmatched_calls"] += 1
@@ -661,8 +749,7 @@ def codex_records(objects, diagnostics):
         if not isinstance(p, dict):
             normalized.append(obj)
             continue
-        kind, identity = p.get("type"), p.get("call_id")
-        identity = identity if isinstance(identity, str) and identity else None
+        kind, identity = p.get("type"), tool_identity(p)
         if obj.get("type") == "event_msg" and kind in ("user_message", "agent_message"):
             role = "user" if kind == "user_message" else "assistant"
             key = (role, p.get("message", ""), obj.get("timestamp"))
@@ -686,7 +773,7 @@ def codex_records(objects, diagnostics):
             if identity:
                 emitted.add(identity)
             call = calls.get(identity, {})
-            if not identity or (not call and (not is_alias or p.get("requires_association"))):
+            if not identity or (not call and not is_alias):
                 diagnostics["unmatched_results"] += 1
             arguments = call.get("arguments", call.get("input", {}))
             if isinstance(arguments, str):
@@ -700,7 +787,7 @@ def codex_records(objects, diagnostics):
             facts = [tool_facts(value) for value in group]
             # A disagreement on any mutually observed fact makes the identity unsafe.
             # Compare all results, rather than replacing an earlier alias with a later one.
-            for key in ("codes", "flags", "status", "name", "command", "cwd", "output", "aggregated_output", "stderr", "native_status"):
+            for key in ("codes", "flags", "status", "name", "command", "cwd", "output", "aggregated_output", "stderr", "native_status", "namespace", "mcp_meta", "native_metadata", "native_turn_id"):
                 values = {json.dumps(f[key], sort_keys=True) for f in facts if key in f and not (key in ("codes", "flags") and not f[key]) and not (key == "status" and f[key] == "unknown")}
                 if len(values) > 1:
                     diagnostics["identity_conflicts"] += 1
@@ -725,7 +812,12 @@ def codex_records(objects, diagnostics):
             output = selected["output"] if selected.get("output") is not None else selected
             name = call.get("name", p.get("name", "exec") if is_alias else "unknown")
             evidence = sorted({json.dumps(f, sort_keys=True, separators=(",", ":")) for f in facts})
-            observation = {"call_id": identity, "name": name, "executed_cwd": executed_cwd, "status": status, "timestamp": obj.get("timestamp"), "result_digest": hashlib.sha256(json.dumps(evidence).encode()).hexdigest()}
+            observation = {"call_id": identity[1] if identity and identity[0] == "tool" else None, "name": name, "executed_cwd": executed_cwd, "status": status, "timestamp": obj.get("timestamp"), "result_digest": hashlib.sha256(json.dumps(evidence).encode()).hexdigest()}
+            if identity and identity[0] == "native":
+                observation["native_item_id"] = identity[1]
+            native_statuses = {f["native_status"] for f in facts if isinstance(f.get("native_status"), str) and f["native_status"] in ("completed", "failed")}
+            if len(native_statuses) == 1:
+                observation["native_status"] = next(iter(native_statuses))
             diagnostics["tool_observations"].append(observation)
             normalized.append({"type": "_reader_tool", "timestamp": obj.get("timestamp", ""), **observation, "target": command if isinstance(command, str) else "", "output": output, "exit_codes": codes})
         elif obj.get("type") != "response_item" or kind not in ("function_call", "custom_tool_call"):
@@ -820,6 +912,13 @@ def full_identity(objects):
         if not isinstance(p, dict):
             invalid = True
             continue
+        native = obj.get("payload", {})
+        if obj.get("type") == "event_msg" and isinstance(native, dict) and native.get("type") == "item_completed" and "thread_id" in native:
+            thread = native["thread_id"]
+            if not isinstance(thread, str) or not thread:
+                invalid = True
+            elif thread not in identity["session"]:
+                identity["session"].append(thread)
         # Inspect every alias, including explicit empty values; precedence must
         # not hide another supplied session, parent or version identity.
         fields = [("cwd", "cwd"), ("sessionId", "session"), ("parent_session_id", "parent_session"),
@@ -914,12 +1013,14 @@ def prepare_records(objects, platform):
             if obj.get("type") not in known or (obj.get("type") in ("response_item", "event_msg") and (not isinstance(obj.get("payload"), dict) or obj["payload"].get("type") not in payloads)):
                 unknown_record(diagnostics, obj)
             p = obj.get("payload", {})
+            if obj.get("type") == "response_item" and isinstance(p, dict) and p.get("type") in ("function_call_output", "custom_tool_call_output") and "call_id" not in p and not native_output(obj):
+                unknown_record(diagnostics, obj)
             if obj.get("type") == "event_msg" and isinstance(p, dict) and p.get("type") == "item_completed":
                 item = p.get("item", {})
                 if known_completed_user(obj):
                     inspect_message_content(message_text(item["content"]), platform, diagnostics)
-                elif known_web_extension(obj):
-                    diagnostics["omitted"] += 1
+                elif known_web_extension(obj) or known_native_extra(obj):
+                    diagnostics["omitted"] += int(item["type"] in ("Extension", "ImageView", "CollabAgentToolCall"))
                 elif not isinstance(item, dict) or item.get("type") not in ("Reasoning", "AgentMessage", "SubAgentActivity", "CommandExecution", "McpToolCall", "FileChange", "ContextCompaction"):
                     unknown_record(diagnostics, obj)
                 elif item.get("type") in ("CommandExecution", "McpToolCall", "FileChange") and item.get("status") not in ("completed", "failed"):
@@ -1023,7 +1124,9 @@ def record_links(obj, platform):
             return links, 1
         kind = p.get("type")
         if kind in ("function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output", "exec_command_begin", "exec_command_end", "exec_command_output_delta"):
-            link("tool", p.get("call_id"), True)
+            identity = tool_identity(p)
+            if identity: links.add(identity)
+            else: missing += 1
         if kind == "message":
             link("message", p.get("id"))
             if obj.get("timestamp") and p.get("role") in ("user", "assistant"):
@@ -1308,7 +1411,31 @@ def stream_digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode()).hexdigest()
 
 
-STREAM_FACT_FIELDS = ("codes", "flags", "status", "name", "command", "cwd", "output", "aggregated_output", "stderr", "native_status")
+STREAM_FACT_FIELDS = ("codes", "flags", "status", "name", "command", "cwd", "output", "aggregated_output", "stderr", "native_status", "namespace", "mcp_meta", "native_metadata", "native_turn_id")
+STREAM_INLINE_FACTS = ("output", "aggregated_output")
+STREAM_FACT_OFFSETS = {}
+STREAM_GROUP_BYTES = 5  # Presence bitmap and requires-association flag.
+for _field in STREAM_FACT_FIELDS:
+    STREAM_FACT_OFFSETS[_field] = STREAM_GROUP_BYTES
+    STREAM_GROUP_BYTES += 32 if _field in STREAM_INLINE_FACTS else 4
+
+
+def stream_fact(group, key, value=None):
+    import struct
+    bit = 1 << STREAM_FACT_FIELDS.index(key)
+    present = int.from_bytes(group[:4], "little")
+    offset = STREAM_FACT_OFFSETS[key]
+    if value is not None:
+        group[:4] = (present | bit).to_bytes(4, "little")
+        if key in STREAM_INLINE_FACTS:
+            group[offset:offset + 32] = value
+        else:
+            struct.pack_into("<I", group, offset, value)
+    elif present & bit:
+        return bytes(group[offset:offset + 32]) if key in STREAM_INLINE_FACTS else struct.unpack_from("<I", group, offset)[0]
+    return None
+
+
 STREAM_INDEX_ENTRIES = 400000
 STREAM_INDEX_BYTES = 48 * 1024 * 1024
 
@@ -1323,6 +1450,7 @@ class StreamIndex:
         self.identities = {k: [] for k in ("cwd", "session", "parent_session", "source", "cli_version")}
         self.invalid, self.child = False, False
         self.unknown, self.parse_errors, self.unknown_links = 0, 0, 0
+        self.unidentified_calls, self.unidentified_results = 0, 0
         self.conflicts = 0
         self.claude_tools = {"identity_conflicts": 0, "unmatched_calls": 0, "unmatched_results": 0}
         self.types = {}
@@ -1398,6 +1526,9 @@ class StreamIndex:
                         self.invalid |= not isinstance(spawn["parent_thread_id"], str) or not spawn["parent_thread_id"]
             if "isSidechain" in obj:
                 self.invalid |= not isinstance(obj["isSidechain"], bool)
+        native = obj.get("payload", {})
+        if obj.get("type") == "event_msg" and isinstance(native, dict) and native.get("type") == "item_completed" and "thread_id" in native:
+            self.invalid |= not isinstance(native["thread_id"], str) or not native["thread_id"]
         self.child |= value["child_context"]
         for key in self.identities:
             for v in value[key]:
@@ -1425,7 +1556,8 @@ class StreamIndex:
             self.types[bucket] = self.types.get(bucket, 0) + value
         self.omitted += diag["omitted"]
         self.truncated += diag["truncated"]
-        p = completed_item(obj).get("payload", {})
+        normalized = completed_item(obj)
+        p = normalized.get("payload", {})
         if platform == "codex" and isinstance(p, dict):
             kind = p.get("type")
             if kind == "message" and obj.get("type") == "response_item":
@@ -1450,7 +1582,7 @@ class StreamIndex:
             if obj.get("type") == "response_item" and kind in ("function_call", "custom_tool_call"):
                 identity = p.get("call_id")
                 if not isinstance(identity, str) or not identity:
-                    self.unknown_links += 1
+                    self.unidentified_calls += 1
                     return
                 key = self.atom(("tool", identity))
                 arguments = p.get("arguments", p.get("input", {}))
@@ -1464,25 +1596,26 @@ class StreamIndex:
                 if key in self.calls and self.calls[key] != value: self.conflicts += 1
                 elif key not in self.calls:
                     self.reserve(128); self.calls[key] = value
-            elif ((obj.get("type") == "response_item" and kind in ("function_call_output", "custom_tool_call_output"))
-                  or (obj.get("type") == "event_msg" and kind == "exec_command_end")):
-                identity = p.get("call_id")
-                if not isinstance(identity, str) or not identity:
-                    self.unknown_links += 1
+            elif ((normalized.get("type") == "response_item" and kind in ("function_call_output", "custom_tool_call_output"))
+                  or (normalized.get("type") == "event_msg" and kind == "exec_command_end")):
+                identity = tool_identity(p)
+                if not identity:
+                    self.unidentified_results += 1
                     return
-                key = self.atom(("tool", identity))
+                key = self.atom(identity)
                 facts = tool_facts(p)
-                fields = {k: self.atom(v) for k, v in facts.items() if k != "omitted" and not (k in ("codes", "flags") and not v) and not (k == "status" and v == "unknown")}
+                fields = {k: bytes.fromhex(stream_digest(v)) if k in STREAM_INLINE_FACTS else self.atom(v) for k, v in facts.items() if k != "omitted" and not (k in ("codes", "flags") and not v) and not (k == "status" and v == "unknown")}
                 if key not in self.results:
-                    from array import array
-                    self.reserve(160)
-                    self.results[key] = array("q", [-1] * len(STREAM_FACT_FIELDS) + [0])
+                    group = bytearray(STREAM_GROUP_BYTES)
+                    # Inline digests replace indexed atoms, not their byte cost.
+                    self.reserve(sys.getsizeof(group) + 64)
+                    self.results[key] = group
                 group = self.results[key]
-                group[-1] |= int(kind != "exec_command_end" or p.get("requires_association", False))
+                group[4] |= int(kind != "exec_command_end")
                 for k, value in fields.items():
-                    at = STREAM_FACT_FIELDS.index(k)
-                    if group[at] == -1: group[at] = value
-                    elif group[at] != value: self.conflicts += 1
+                    previous = stream_fact(group, k)
+                    if previous is None: stream_fact(group, k, value)
+                    elif previous != value: self.conflicts += 1
         elif platform == "claude":
             for key, fingerprint in claude_tool_facts(obj):
                 self.message(("claude-tool", *key), self.atom(fingerprint))
@@ -1503,10 +1636,10 @@ class StreamIndex:
             for key, group in self.results.items():
                 call = self.calls.get(key, (None, (), None))
                 cwds = set(call[1])
-                cwd, command = group[STREAM_FACT_FIELDS.index("cwd")], group[STREAM_FACT_FIELDS.index("command")]
-                if cwd != -1: cwds.add(cwd)
+                cwd, command = stream_fact(group, "cwd"), stream_fact(group, "command")
+                if cwd is not None: cwds.add(cwd)
                 self.conflicts += int(len(cwds) > 1)
-                if call[2] is not None and command != -1 and call[2] != command:
+                if call[2] is not None and command is not None and call[2] != command:
                     self.conflicts += 1
             for candidates in self.agent_messages:
                 if candidates and all(self.messages.get(mid) == sig or self.messages.get(alias) == sig for mid, alias, sig in candidates):
@@ -1515,8 +1648,8 @@ class StreamIndex:
         identity = {**self.identities, "child_context": bool(self.child or self.identities["parent_session"]), "metadata_missing": missing,
                     "invalid": bool(self.invalid or missing or (self.child and not self.identities["parent_session"]))}
         conflicts = self.conflicts + sum(len(v) > 1 for v in self.identities.values())
-        unmatched_results = sum(k not in self.calls and v[-1] for k, v in self.results.items())
-        unmatched_calls = len(set(self.calls) - set(self.results))
+        unmatched_results = self.unidentified_results + sum(k not in self.calls and v[4] for k, v in self.results.items())
+        unmatched_calls = self.unidentified_calls + len(set(self.calls) - set(self.results))
         if platform == "claude":
             conflicts += self.claude_tools["identity_conflicts"]
             unmatched_calls = len(self.calls) + self.claude_tools["unmatched_calls"]

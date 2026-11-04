@@ -365,3 +365,74 @@ test("bounded unknown grammar buckets retain every overflow count", async () => 
     expect(out.meta.global).toEqual(old.meta.global)
   })
 })
+
+test("explicit completed prefix excludes the live call but cannot hide a crossed result", async () => {
+  const call = { type: "response_item", timestamp: stamp, payload: { type: "function_call", call_id: "live", name: "exec", arguments: "{}" } }
+  const result = { type: "response_item", timestamp: stamp, payload: { type: "function_call_output", call_id: "live", output: { exit_code: 0 } } }
+  const selected = message("completed correction")
+  await fixture([meta, selected], async f => {
+    await appendFile(f.file, bytes([call]))
+    const out = await f.run("extract-skeleton.py", ["--start-record", fp(selected), "--end-record", fp(selected)])
+    expect(out.meta.global.unmatched_calls).toBe(0)
+    expect(out.meta.coverage.complete_source).toBe(false)
+    expect(out.meta.coverage.appended_bytes).toBe(bytes([call]).length)
+  })
+  await fixture([meta, selected, call], async f => {
+    await appendFile(f.file, bytes([result]))
+    const out = await f.run("extract-skeleton.py", ["--start-record", fp(selected), "--end-record", fp(selected)])
+    expect(out.meta.global.unmatched_calls).toBe(1)
+    expect(out.meta.coverage.complete_source).toBe(false)
+    const missing = await f.run("extract-skeleton.py", ["--start-record", fp(result), "--end-record", fp(result)])
+    expect(missing.meta.incomplete_reason).toBe("boundary-not-unique-or-ordered")
+  })
+})
+
+test("comparison-only output digests consume bytes without duplicate graph vertices", async () => {
+  const program = `import runpy,json,sys
+m=runpy.run_path(${JSON.stringify(join(dir, "extract-metadata.py"))})
+Index=m['StreamIndex'];g=Index.add.__globals__
+measure=[]
+for compact in [False,True]:
+ g['STREAM_INLINE_FACTS']=('output','aggregated_output') if compact else ()
+ g['STREAM_GROUP_BYTES']=5;g['STREAM_FACT_OFFSETS']={}
+ for field in g['STREAM_FACT_FIELDS']:
+  g['STREAM_FACT_OFFSETS'][field]=g['STREAM_GROUP_BYTES'];g['STREAM_GROUP_BYTES']+=32 if field in g['STREAM_INLINE_FACTS'] else 4
+ index=Index(False)
+ for i in range(2000):
+  obj={'type':'event_msg','payload':{'type':'exec_command_end','call_id':'call-'+str(i),'output':{'exit_code':0,'output':'unique-'+str(i)},'aggregated_output':'raw-'+str(i)}}
+  index.add_links(i,obj,'codex',False);index.add(obj,'codex')
+ measure.append({'entries':index.entries,'bytes':index.bytes,'diagnostic':index.finish('codex')[0]})
+print(json.dumps({'measure':measure,'inline':list(g['STREAM_INLINE_FACTS'])}))`
+  const out = await execute(["python3", "-c", program])
+  const [indexed, inline] = out.measure
+  expect(inline.diagnostic).toEqual(indexed.diagnostic)
+  expect(inline.entries).toBe(indexed.entries - 4000)
+  expect(inline.bytes).toBeLessThan(indexed.bytes)
+  expect(inline.bytes).toBeGreaterThan(2000 * 64)
+  expect(out.inline).toEqual(["output", "aggregated_output"])
+})
+
+test("packed facts preserve zero, absent, full digests and the independent association flag", async () => {
+  const program = `import runpy,json,sys
+m=runpy.run_path(${JSON.stringify(join(dir, "extract-metadata.py"))})
+group=bytearray(m['STREAM_GROUP_BYTES']);fact=m['stream_fact']
+assert all(fact(group,k) is None for k in m['STREAM_FACT_FIELDS'])
+for n,k in enumerate(m['STREAM_FACT_FIELDS']):
+ value=bytes(range(32)) if k in m['STREAM_INLINE_FACTS'] else (0 if n==0 else 399999)
+ fact(group,k,value)
+ assert fact(group,k)==value
+assert group[4]==0
+group[4]=1
+assert fact(group,'codes')==0
+assert fact(group,'output')==bytes(range(32))
+assert fact(group,'aggregated_output')==bytes(range(32))
+fact(group,'output',bytes(32))
+assert fact(group,'output')==bytes(32)
+assert fact(group,'aggregated_output')==bytes(range(32))
+print(json.dumps({'footprint':sys.getsizeof(group),'length':len(group),'fields':len(m['STREAM_FACT_FIELDS']),'association':group[4]}))`
+  const out = await execute(["python3", "-c", program])
+  expect(out.association).toBe(1)
+  expect(out.fields).toBe(14)
+  expect(out.footprint).toBeGreaterThan(out.length)
+  expect(out.footprint + 64).toBeLessThan(300)
+})
