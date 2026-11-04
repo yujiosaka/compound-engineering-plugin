@@ -396,7 +396,8 @@ for compact in [False,True]:
  g['STREAM_INLINE_FACTS']=('output','aggregated_output') if compact else ()
  g['STREAM_GROUP_BYTES']=5;g['STREAM_FACT_OFFSETS']={}
  for field in g['STREAM_FACT_FIELDS']:
-  g['STREAM_FACT_OFFSETS'][field]=g['STREAM_GROUP_BYTES'];g['STREAM_GROUP_BYTES']+=32 if field in g['STREAM_INLINE_FACTS'] else 4
+  if field not in g['STREAM_INLINE_FACTS']:
+   g['STREAM_FACT_OFFSETS'][field]=g['STREAM_GROUP_BYTES'];g['STREAM_GROUP_BYTES']+=4
  index=Index(False)
  for i in range(2000):
   obj={'type':'event_msg','payload':{'type':'exec_command_end','call_id':'call-'+str(i),'output':{'exit_code':0,'output':'unique-'+str(i)},'aggregated_output':'raw-'+str(i)}}
@@ -419,14 +420,14 @@ group=bytearray(m['STREAM_GROUP_BYTES']);fact=m['stream_fact']
 assert all(fact(group,k) is None for k in m['STREAM_FACT_FIELDS'])
 for n,k in enumerate(m['STREAM_FACT_FIELDS']):
  value=bytes(range(32)) if k in m['STREAM_INLINE_FACTS'] else (0 if n==0 else 399999)
- fact(group,k,value)
+ group=fact(group,k,value)
  assert fact(group,k)==value
 assert group[4]==0
 group[4]=1
 assert fact(group,'codes')==0
 assert fact(group,'output')==bytes(range(32))
 assert fact(group,'aggregated_output')==bytes(range(32))
-fact(group,'output',bytes(32))
+group=fact(group,'output',bytes(32))
 assert fact(group,'output')==bytes(32)
 assert fact(group,'aggregated_output')==bytes(range(32))
 print(json.dumps({'footprint':sys.getsizeof(group),'length':len(group),'fields':len(m['STREAM_FACT_FIELDS']),'association':group[4]}))`
@@ -435,4 +436,38 @@ print(json.dumps({'footprint':sys.getsizeof(group),'length':len(group),'fields':
   expect(out.fields).toBe(14)
   expect(out.footprint).toBeGreaterThan(out.length)
   expect(out.footprint + 64).toBeLessThan(300)
+})
+
+test("sparse inline facts preserve either arrival order and reject growth beyond the byte cap", async () => {
+  const program = `import runpy,json,sys
+m=runpy.run_path(${JSON.stringify(join(dir, "extract-metadata.py"))});fact=m['stream_fact'];Index=m['StreamIndex'];g=Index.add.__globals__
+for keys in [('output','aggregated_output'),('aggregated_output','output')]:
+ group=bytearray(m['STREAM_GROUP_BYTES']);initial=sys.getsizeof(group)
+ group[4]=1;group=fact(group,'codes',0)
+ group=fact(group,keys[0],b'a'*32)
+ assert len(group)==m['STREAM_GROUP_BYTES']+32
+ assert fact(group,keys[1]) is None
+ assert fact(group,keys[0])==b'a'*32
+ group=fact(group,keys[1],b'b'*32)
+ assert len(group)==m['STREAM_GROUP_BYTES']+64
+ assert fact(group,keys[0])==b'a'*32 and fact(group,keys[1])==b'b'*32
+ assert fact(group,'codes')==0 and group[4]==1
+ assert sys.getsizeof(group)-initial==64
+index=Index(False)
+def row(**facts): return {'type':'event_msg','payload':{'type':'exec_command_end','call_id':'same',**facts}}
+index.add(row(output='first'),'codex');before=index.bytes
+limit=g['STREAM_INDEX_BYTES'];g['STREAM_INDEX_BYTES']=before+31
+try:
+ index.add(row(aggregated_output='second'),'codex')
+ raise AssertionError('growth admitted beyond remaining bytes')
+except m['StreamLimit']: pass
+assert index.bytes==before
+g['STREAM_INDEX_BYTES']=limit
+index.add(row(aggregated_output='second'),'codex')
+assert index.bytes==before+32
+index.add(row(output='different'),'codex')
+assert index.finish('codex')[0]['identity_conflicts']==1
+print(json.dumps({'growth':index.bytes-before,'conflicts':index.finish('codex')[0]['identity_conflicts']}))`
+  const out = await execute(["python3", "-c", program])
+  expect(out).toEqual({ growth: 32, conflicts: 1 })
 })

@@ -1416,23 +1416,31 @@ STREAM_INLINE_FACTS = ("output", "aggregated_output")
 STREAM_FACT_OFFSETS = {}
 STREAM_GROUP_BYTES = 5  # Presence bitmap and requires-association flag.
 for _field in STREAM_FACT_FIELDS:
-    STREAM_FACT_OFFSETS[_field] = STREAM_GROUP_BYTES
-    STREAM_GROUP_BYTES += 32 if _field in STREAM_INLINE_FACTS else 4
+    if _field not in STREAM_INLINE_FACTS:
+        STREAM_FACT_OFFSETS[_field] = STREAM_GROUP_BYTES
+        STREAM_GROUP_BYTES += 4
 
 
 def stream_fact(group, key, value=None):
     import struct
     bit = 1 << STREAM_FACT_FIELDS.index(key)
     present = int.from_bytes(group[:4], "little")
-    offset = STREAM_FACT_OFFSETS[key]
+    inline = key in STREAM_INLINE_FACTS
+    offset = (STREAM_GROUP_BYTES + 32 * sum(bool(present & (1 << STREAM_FACT_FIELDS.index(k)))
+              for k in STREAM_INLINE_FACTS[:STREAM_INLINE_FACTS.index(key)])) if inline else STREAM_FACT_OFFSETS[key]
     if value is not None:
-        group[:4] = (present | bit).to_bytes(4, "little")
-        if key in STREAM_INLINE_FACTS:
+        if inline and not present & bit:
+            # Only observed digests occupy storage; preserve the other columns
+            # when a previously absent digest arrives after its sibling.
+            group = group[:offset] + value + group[offset:]
+        elif inline:
             group[offset:offset + 32] = value
         else:
             struct.pack_into("<I", group, offset, value)
-    elif present & bit:
-        return bytes(group[offset:offset + 32]) if key in STREAM_INLINE_FACTS else struct.unpack_from("<I", group, offset)[0]
+        group[:4] = (present | bit).to_bytes(4, "little")
+        return group
+    if present & bit:
+        return bytes(group[offset:offset + 32]) if inline else struct.unpack_from("<I", group, offset)[0]
     return None
 
 
@@ -1614,7 +1622,11 @@ class StreamIndex:
                 group[4] |= int(kind != "exec_command_end")
                 for k, value in fields.items():
                     previous = stream_fact(group, k)
-                    if previous is None: stream_fact(group, k, value)
+                    if previous is None:
+                        updated = stream_fact(group, k, value)
+                        if updated is not group:
+                            self.reserve(sys.getsizeof(updated) - sys.getsizeof(group), entries=0)
+                            self.results[key] = group = updated
                     elif previous != value: self.conflicts += 1
         elif platform == "claude":
             for key, fingerprint in claude_tool_facts(obj):
