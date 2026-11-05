@@ -874,31 +874,130 @@ def inspect_message_content(content, platform, diagnostics):
 
 
 
+SHAPE_KINDS = {
+    "str": lambda v: isinstance(v, str), "bool": lambda v: isinstance(v, bool), "null": lambda v: v is None,
+    "int": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "num": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "count": lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0,
+    "obj": lambda v: isinstance(v, dict),
+    "strings": lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v),
+    "objects": lambda v: isinstance(v, list) and all(isinstance(x, dict) for x in v),
+    "empty": lambda v: isinstance(v, list) and not v,
+}
+
+
+def known_shape(value, required, optional=None):
+    """Exact observed keys and value kinds; anything else stays unknown."""
+    optional = optional or {}
+    if not isinstance(value, dict) or not set(required) <= set(value) <= set(required) | set(optional):
+        return False
+    return all(SHAPE_KINDS[kind](value[key]) for key, kind in {**required, **optional}.items() if key in value)
+
+
+# Keys seen on every record of a type are required; keys seen on some are optional.
+CLAUDE_ATTACHMENTS = {
+    "deferred_tools_delta": ({"addedNames": "strings", "addedLines": "strings", "removedNames": "empty", "readdedNames": "empty"},
+                             {"pendingMcpServers": "empty", "needsAuthMcpServers": "empty", "failedMcpServers": "objects",
+                              "surfacedDefinitions": "objects", "surfacedNames": "strings", "wireHiddenNames": "empty"}),
+    "agent_listing_delta": ({"addedTypes": "strings", "addedLines": "strings", "removedTypes": "empty", "isInitial": "bool", "showConcurrencyNote": "bool"},
+                            {"builtInPluginTypes": "empty", "builtInTypes": "strings"}),
+    "mcp_instructions_delta": ({"addedNames": "strings", "addedBlocks": "strings", "removedNames": "empty"}, {}),
+    "skill_listing": ({"content": "str", "skillCount": "count", "isInitial": "bool", "names": "strings"}, {"digests": "strings"}),
+    "date_change": ({"newDate": "str"}, {}),
+    "date": ({"date": "str"}, {"changed": "bool"}),
+    "hook_success": ({"command": "str", "content": "str", "durationMs": "int", "exitCode": "int", "hookEvent": "str", "hookName": "str",
+                      "stderr": "str", "stdout": "str", "toolUseID": "str"}, {}),
+    "hook_additional_context": ({"content": "strings", "hookEvent": "str", "hookName": "str", "toolUseID": "str"}, {}),
+    "total_tokens_reminder": ({"text": "str"}, {}),
+    "silent_turn_reminder": ({"text": "str"}, {}),
+    "batching_reminder_sent": ({"clearAt": "str", "model": "str", "text": "str"}, {}),
+    "deferred_tools_record": ({"entries": "objects"}, {"toolInputCopies": "objects"}),
+    "file": ({"content": "obj", "displayPath": "str", "filename": "str"}, {}),
+    "compact_file_reference": ({"displayPath": "str", "filename": "str"}, {}),
+    "prompt_snapshot": ({"contextRendering": "str", "echoWireToolInputs": "bool", "reminderFold": "bool", "systemPrompt": "strings"},
+                        {"cliPrefix": "str", "inlineTools": "bool", "keptReminders": "bool", "systemTurns": "bool",
+                         "toolChangeHeader": "bool", "tools": "objects"}),
+    "remote_session_change": ({"commit": "str", "managedCommit": "bool", "managedPr": "bool", "pr": "str", "sendUserFileHint": "bool", "url": "null"}, {}),
+    "model": ({"identity": "obj", "text": "str"}, {}),
+    "instructions": ({"files": "objects"}, {"changed": "bool", "reason": "str"}),
+    "session_context": ({"context": "obj"}, {"changed": "bool", "reason": "str"}),
+    "environment": ({"snapshot": "obj"}, {}),
+    "auto_mode": ({"autoModeConsentFlow": "bool", "bashFirst": "bool", "bashFirstSteer": "str", "bypass": "bool",
+                   "finishExposedWork": "bool", "steerOnly": "bool"}, {}),
+    "command_permissions": ({"allowedTools": "empty"}, {}),
+    "credential_org": ({"organizationUuid": "str"}, {}),
+    "queued_command": ({"commandMode": "str", "delivery_id": "str", "origin": "obj", "prompt": "str", "runId": "str",
+                        "source_uuid": "str", "timestamp": "str"}, {"usage": "obj"}),
+    "invoked_skills": ({"skills": "objects"}, {}),
+    "task_status": ({"canContinueAgent": "bool", "deltaSummary": "null", "description": "str", "outputFilePath": "str",
+                     "status": "str", "taskId": "str", "taskType": "str"}, {}),
+}
+
+
 def known_context_attachment(obj):
     """Recognized runtime context is unread evidence, not an execution result."""
-    root = {"attachment", "cwd", "entrypoint", "gitBranch", "isSidechain", "parentUuid", "sessionId", "timestamp", "type", "userType", "uuid", "version"}
-    if set(obj) != root or not isinstance(obj.get("isSidechain"), bool):
+    root = {"type": "str", "attachment": "obj", "cwd": "str", "entrypoint": "str", "gitBranch": "str", "isSidechain": "bool",
+            "sessionId": "str", "timestamp": "str", "userType": "str", "uuid": "str", "version": "str"}
+    optional = {"slug": "str", "rendered": "objects", "renderedRole": "str", "renderedBesideToolResult": "bool", "renderedInHumanTurn": "objects"}
+    if not isinstance(obj, dict) or "parentUuid" not in obj or (obj["parentUuid"] is not None and not isinstance(obj["parentUuid"], str)):
         return False
-    if any(not isinstance(obj[key], str) for key in root - {"attachment", "isSidechain", "parentUuid"}):
+    if not known_shape({key: value for key, value in obj.items() if key != "parentUuid"}, root, optional):
         return False
-    if obj["parentUuid"] is not None and not isinstance(obj["parentUuid"], str):
+    value = obj["attachment"]
+    shape = CLAUDE_ATTACHMENTS.get(value.get("type")) if isinstance(value.get("type"), str) else None
+    return shape is not None and known_shape(value, {"type": "str", **shape[0]}, shape[1])
+
+
+# The request journal and session bookkeeping carry no conversation or execution evidence.
+CLAUDE_JOURNAL = {
+    "api-request": ({"cacheControl": "objects", "id": "str", "keep": "int", "params": "obj", "querySource": "str", "requestDigest": "str",
+                     "sessionId": "str", "shapeHash": "str", "tail": "strings", "timestamp": "str", "version": "str"}, {"base": "str"}),
+    "api-request-shape": ({"sessionId": "str", "shape": "obj", "shapeHash": "str", "timestamp": "str", "version": "str"}, {}),
+    "atis-latch": ({"atis": "str", "sessionId": "str"}, {}),
+    "bridge-session": ({"bridgeSessionId": "str", "lastSequenceNum": "int", "ownerAccountUuid": "str", "ownerOrganizationUuid": "str", "sessionId": "str"}, {}),
+    "cost-state": ({"hasUnknownModelCost": "bool", "modelUsage": "obj", "sessionId": "str", "startTime": "int", "totalAPIDuration": "int",
+                    "totalAPIDurationWithoutRetries": "int", "totalCostUSD": "num", "totalDuration": "int", "totalLinesAdded": "int",
+                    "totalLinesRemoved": "int", "totalToolDuration": "int"}, {}),
+}
+CLAUDE_COPY = "api-request-blob"
+CLAUDE_COPY_BLOCKS = {"text", "image", "thinking", "redacted_thinking", "tool_use", "tool_result", "tool_addition"}
+
+
+def known_claude_copy(obj):
+    """A wire-form copy of a message: recognized by shape, never rendered or compared."""
+    if not known_shape(obj, {"type": "str", "hash": "str", "sessionId": "str", "message": "obj"}):
         return False
-    shapes = {
-        "deferred_tools_delta": {"addedNames": "strings", "addedLines": "strings", "removedNames": "empty", "readdedNames": "empty", "pendingMcpServers": "empty", "needsAuthMcpServers": "empty"},
-        "agent_listing_delta": {"addedTypes": "strings", "addedLines": "strings", "removedTypes": "empty", "isInitial": "bool", "showConcurrencyNote": "bool"},
-        "mcp_instructions_delta": {"addedNames": "strings", "addedBlocks": "strings", "removedNames": "empty"},
-        "skill_listing": {"content": "str", "skillCount": "count", "isInitial": "bool", "names": "strings"},
-        "date_change": {"newDate": "str"},
-    }
-    value = obj.get("attachment")
-    shape = shapes.get(value.get("type")) if isinstance(value, dict) and isinstance(value.get("type"), str) else None
-    if shape is None or set(value) != set(shape) | {"type"}:
+    message = obj["message"]
+    if not known_shape(message, {"role": "str", "content": "str"}, {"clear_at": "str", "output_config": "obj"}) and not known_shape(
+            message, {"role": "str", "content": "objects"}, {"clear_at": "str", "output_config": "obj"}):
         return False
-    checks = {"str": lambda v: isinstance(v, str), "bool": lambda v: isinstance(v, bool),
-              "count": lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0,
-              "strings": lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v),
-              "empty": lambda v: isinstance(v, list) and not v}
-    return all(checks[kind](value[key]) for key, kind in shape.items())
+    if message["role"] not in ("system", "user", "assistant"):
+        return False
+    for block in message["content"] if isinstance(message["content"], list) else []:
+        kind = block.get("type")
+        if not isinstance(kind, str) or kind not in CLAUDE_COPY_BLOCKS:
+            return False
+        if kind in ("tool_use", "tool_result"):
+            identity = block.get("id" if kind == "tool_use" else "tool_use_id")
+            if not isinstance(identity, str) or not identity:
+                return False
+    return True
+
+
+def claude_copy_ids(obj):
+    """Tool identities a recognized wire copy names; its bodies are not evidence."""
+    if obj.get("type") != CLAUDE_COPY or not known_claude_copy(obj):
+        return
+    content = obj["message"]["content"]
+    for block in content if isinstance(content, list) else []:
+        if block["type"] in ("tool_use", "tool_result"):
+            yield block["type"], block["id" if block["type"] == "tool_use" else "tool_use_id"]
+
+
+def unresolved_claude_copies(objects):
+    """Every copied identity must name a conversation record of the same input."""
+    recorded = {key for obj in objects for key, _ in claude_tool_facts(obj)}
+    return len({key for obj in objects for key in claude_copy_ids(obj)} - recorded)
 
 
 
@@ -990,7 +1089,7 @@ def claude_tool_step(block, calls, diagnostics, identify=lambda value: value, re
     return call
 
 
-def prepare_records(objects, platform):
+def prepare_records(objects, platform, copies=True):
     diagnostics = dict(platform=platform, unsupported=platform not in ("claude", "codex", "pi", "omp"), unknown_records=0,
                        omitted=0, truncated=0, identity_conflicts=0, unmatched_calls=0, unmatched_results=0,
                        unknown_results=0, tool_observations=[], unknown_record_types={})
@@ -1043,16 +1142,26 @@ def prepare_records(objects, platform):
     elif platform == "claude":
         known = {"user", "assistant", "system", "progress", "file-history-snapshot", "queue-operation", "summary", "last-prompt", "custom-title", "agent-name", "agent-color", "pr-link", "saved_hook_context", "bridge_status"}
         for obj in objects:
-            if obj.get("type") == "attachment" and known_context_attachment(obj):
+            kind = obj.get("type") if isinstance(obj.get("type"), str) else None
+            if kind == "attachment" and known_context_attachment(obj):
                 diagnostics["omitted"] += 1
-            elif obj.get("type") not in known:
+            elif kind == CLAUDE_COPY and known_claude_copy(obj):
+                pass
+            elif kind in CLAUDE_JOURNAL and known_shape(obj, {"type": "str", **CLAUDE_JOURNAL[kind][0]}, CLAUDE_JOURNAL[kind][1]):
+                pass
+            elif kind not in known:
                 unknown_record(diagnostics, obj)
+        # A selected or outside subset cannot resolve a copy; its caller counts the whole input.
+        if copies:
+            diagnostics["unknown_records"] += unresolved_claude_copies(objects)
         calls = {}
         for obj in objects:
             message = obj.get("message", {})
             if not isinstance(message, dict):
                 diagnostics["unknown_records"] += 1
                 continue
+            if obj.get("type") not in ("user", "assistant"):
+                continue  # Only conversation records hold calls and results.
             content = message.get("content", [])
             for block in content if isinstance(content, list) else []:
                 if not isinstance(block, dict):
@@ -1076,7 +1185,7 @@ def prepare_records(objects, platform):
     for obj in objects:
         if obj.get("type") == "_reader_tool":
             diagnostics["truncated"] += int(len(obj["target"]) > 120 or len(str(obj["output"])) > 200)
-        else:
+        elif platform != "claude" or obj.get("type") in ("user", "assistant"):
             p = obj.get("payload", obj.get("message", {}))
             if isinstance(p, dict):
                 content = p.get("content", "")
@@ -1099,7 +1208,7 @@ def record_fingerprint(obj):
 
 
 def claude_tool_facts(obj):
-    message = obj.get("message", {})
+    message = obj.get("message", {}) if obj.get("type") in ("user", "assistant") else {}
     content = message.get("content", []) if isinstance(message, dict) else []
     for block in content if isinstance(content, list) else []:
         if isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result"):
@@ -1145,7 +1254,7 @@ def record_links(obj, platform):
                     link("message-alias", json.dumps(["assistant", obj["timestamp"], message_text(content)]))
     elif platform == "claude":
         link("record", obj.get("uuid"))
-        msg = obj.get("message", {})
+        msg = obj.get("message", {}) if obj.get("type") in ("user", "assistant") else {}
         if isinstance(msg, dict):
             content = msg.get("content", [])
             for block in content if isinstance(content, list) else []:
@@ -1160,7 +1269,8 @@ def boundary_headers(objects):
         return value if isinstance(value, str) and len(value) <= limit and re.fullmatch(r"[A-Za-z0-9_.:-]+", value) else None
     rows = []
     for obj in objects[:1000]:
-        p = obj.get("payload") if isinstance(obj.get("payload"), dict) else obj.get("message", {})
+        # Without a payload, only a conversation record's message names a role.
+        p = obj.get("payload") if isinstance(obj.get("payload"), dict) else obj.get("message", {}) if obj.get("type") in ("user", "assistant", "message") else {}
         p = p if isinstance(p, dict) else {}
         kind = identifier(obj.get("type"), 64) or "unknown"
         if obj.get("type") in ("response_item", "event_msg"):
@@ -1186,13 +1296,15 @@ def boundary_headers(objects):
 def prepare_window(objects, platform, start, end, parse_errors=0, boundaries=False):
     """Keep global uncertainty; exclude only records proven outside a native ID closure."""
     import re
-    _, whole = prepare_records(objects, platform)
+    _, whole = prepare_records(objects, platform, copies=False)
     identities = reader_metadata([json.dumps(obj) for obj in objects])
     links, unknown_links = [], int(whole["full_identity"]["invalid"])
     for obj in objects:
         keys, missing = record_links(obj, platform)
         links.append(keys)
         unknown_links += missing
+    if platform == "claude":
+        unknown_links += unresolved_claude_copies(objects)
     # Claude's sequential renderer cannot reconcile repeated tool IDs itself.
     # Compare every same-ID fact before a selected window can hide a disagreement.
     facts = {}
@@ -1253,8 +1365,8 @@ def prepare_window(objects, platform, start, end, parse_errors=0, boundaries=Fal
             for other in by_link[key] - selected:
                 selected.add(other)
                 pending.append(other)
-    chosen, diag = prepare_records([obj for i, obj in enumerate(objects) if i in selected], platform)
-    _, outside = prepare_records([obj for i, obj in enumerate(objects) if i not in selected], platform)
+    chosen, diag = prepare_records([obj for i, obj in enumerate(objects) if i in selected], platform, copies=False)
+    _, outside = prepare_records([obj for i, obj in enumerate(objects) if i not in selected], platform, copies=False)
     outside.pop("tool_observations", None)
     outside.pop("full_identity", None)
     diag["full_identity"] = whole["full_identity"]
@@ -1449,8 +1561,9 @@ STREAM_INDEX_BYTES = 48 * 1024 * 1024
 
 
 class StreamIndex:
-    def __init__(self, closure=True):
+    def __init__(self, closure=True, copies=True):
         self.entries, self.bytes = 0, 0
+        self.copies = set() if copies else None
         from array import array
         self.closure = closure
         self.atoms, self.parent, self.records, self.seeds = {}, array("I"), array("Q"), set()
@@ -1555,7 +1668,7 @@ class StreamIndex:
 
     def add(self, obj, platform):
         self.add_identity(obj)
-        _, diag = prepare_records([obj], platform)
+        _, diag = prepare_records([obj], platform, copies=False)
         if platform != "claude":
             self.conflicts += diag["identity_conflicts"] - sum(len(diag["full_identity"][k]) > 1 for k in self.identities)
         self.unknown += diag["unknown_records"]
@@ -1633,7 +1746,12 @@ class StreamIndex:
                 self.message(("claude-tool", *key), self.atom(fingerprint))
             if isinstance(obj.get("uuid"), str) and obj["uuid"]:
                 self.message(["record", obj["uuid"]], self.atom(obj))
-            msg = obj.get("message", {})
+            for key in claude_copy_ids(obj) if self.copies is not None else ():
+                key = bytes.fromhex(stream_digest(("claude-tool", *key)))
+                if key not in self.copies:
+                    self.reserve(160)
+                    self.copies.add(key)
+            msg = obj.get("message", {}) if obj.get("type") in ("user", "assistant") else {}
             content = msg.get("content", []) if isinstance(msg, dict) else []
             for b in content if isinstance(content, list) else []:
                 if not isinstance(b, dict) or b.get("type") not in ("tool_use", "tool_result"): continue
@@ -1666,9 +1784,11 @@ class StreamIndex:
             conflicts += self.claude_tools["identity_conflicts"]
             unmatched_calls = len(self.calls) + self.claude_tools["unmatched_calls"]
             unmatched_results = self.claude_tools["unmatched_results"]
+        # A copied identity resolves through the key its conversation fact holds in self.messages.
+        unresolved = sum(key not in self.messages for key in self.copies or ())
         return {"unsupported": platform not in ("claude", "codex"), "identity_conflicts": conflicts, "unknown_records": self.unknown,
                 "unmatched_calls": unmatched_calls, "unmatched_results": unmatched_results,
-                "parse_errors": self.parse_errors, "unknown_links": self.unknown_links + int(identity["invalid"]),
+                "parse_errors": self.parse_errors, "unknown_links": self.unknown_links + unresolved + int(identity["invalid"]),
                 "selection_errors": 0, "metadata_missing": missing}, identity
 
 
@@ -1757,7 +1877,7 @@ def stream_window(args):
                     if len(headers) < 1000: headers.append(h)
         global_diag, identity = index.finish(platform)
         if boundaries:
-            _, diag = prepare_records([], platform)
+            _, diag = prepare_records([], platform, copies=False)
             diag.update(global_diag, full_identity=identity)
             diag.update(omitted=index.omitted, truncated=index.truncated, unknown_record_types=index.types)
             diag["global"] = global_diag
@@ -1770,12 +1890,12 @@ def stream_window(args):
         selected_ordinals = {value >> 32 for value in index.records if index.root(value & 0xffffffff) in roots}
         # The first-pass index has served closure/global validation. Release its
         # containers before the second-pass outside accumulator is populated.
-        for table in (index.atoms, index.calls, index.results, index.messages, index.agent_messages, index.seeds):
+        for table in (index.atoms, index.calls, index.results, index.messages, index.agent_messages, index.seeds, index.copies):
             table.clear()
         del index.parent[:]
         del index.records[:]
         chosen, chosen_bytes, selected_count = [], 0, 0
-        outside = StreamIndex(closure=False)
+        outside = StreamIndex(closure=False, copies=False)
         for ordinal, offset, length, obj in source.rows():
             if obj is None: continue
             if first <= ordinal <= last or ordinal in selected_ordinals:
@@ -1784,7 +1904,7 @@ def stream_window(args):
                 chosen.append(obj); selected_count += 1
             else:
                 outside.add(obj, platform)
-        normalized, diag = prepare_records(chosen, platform)
+        normalized, diag = prepare_records(chosen, platform, copies=False)
         outside_global, _ = outside.finish(platform)
         diag["outside"] = {**outside_global, "omitted": outside.omitted, "truncated": outside.truncated,
                            "unknown_record_types": outside.types, "unknown_results": 0}
