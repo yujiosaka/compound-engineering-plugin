@@ -877,7 +877,7 @@ def inspect_message_content(content, platform, diagnostics):
 SHAPE_KINDS = {
     "str": lambda v: isinstance(v, str), "bool": lambda v: isinstance(v, bool), "null": lambda v: v is None,
     "int": lambda v: isinstance(v, int) and not isinstance(v, bool),
-    "num": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "num": lambda v: not isinstance(v, bool) and (isinstance(v, int) or (isinstance(v, float) and v == v and abs(v) != float("inf"))),
     "count": lambda v: isinstance(v, int) and not isinstance(v, bool) and v >= 0,
     "obj": lambda v: isinstance(v, dict),
     "strings": lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v),
@@ -996,7 +996,7 @@ def claude_copy_ids(obj):
 
 def unresolved_claude_copies(objects):
     """Every copied identity must name a conversation record of the same input."""
-    recorded = {key for obj in objects for key, _ in claude_tool_facts(obj)}
+    recorded = {key for obj in objects for key, _ in claude_tool_blocks(obj)}
     return len({key for obj in objects for key in claude_copy_ids(obj)} - recorded)
 
 
@@ -1149,19 +1149,19 @@ def prepare_records(objects, platform, copies=True):
                 pass
             elif kind in CLAUDE_JOURNAL and known_shape(obj, {"type": "str", **CLAUDE_JOURNAL[kind][0]}, CLAUDE_JOURNAL[kind][1]):
                 pass
-            elif kind not in known:
+            elif kind not in known or (kind not in ("user", "assistant") and "message" in obj):
                 unknown_record(diagnostics, obj)
         # A selected or outside subset cannot resolve a copy; its caller counts the whole input.
         if copies:
             diagnostics["unknown_records"] += unresolved_claude_copies(objects)
         calls = {}
         for obj in objects:
+            if obj.get("type") not in ("user", "assistant"):
+                continue  # Only conversation records hold calls and results.
             message = obj.get("message", {})
             if not isinstance(message, dict):
                 diagnostics["unknown_records"] += 1
                 continue
-            if obj.get("type") not in ("user", "assistant"):
-                continue  # Only conversation records hold calls and results.
             content = message.get("content", [])
             for block in content if isinstance(content, list) else []:
                 if not isinstance(block, dict):
@@ -1207,14 +1207,20 @@ def record_fingerprint(obj):
     return hashlib.sha256(json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
 
 
-def claude_tool_facts(obj):
+def claude_tool_blocks(obj):
+    """Identified call and result blocks; only conversation records hold them."""
     message = obj.get("message", {}) if obj.get("type") in ("user", "assistant") else {}
     content = message.get("content", []) if isinstance(message, dict) else []
     for block in content if isinstance(content, list) else []:
         if isinstance(block, dict) and block.get("type") in ("tool_use", "tool_result"):
             key = (block["type"], block.get("id" if block["type"] == "tool_use" else "tool_use_id"))
             if isinstance(key[1], str):
-                yield key, record_fingerprint(block)
+                yield key, block
+
+
+def claude_tool_facts(obj):
+    for key, block in claude_tool_blocks(obj):
+        yield key, record_fingerprint(block)
 
 
 def record_links(obj, platform):

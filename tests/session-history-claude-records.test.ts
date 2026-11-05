@@ -135,18 +135,26 @@ for (const reader of readers) {
     const rows = [...turn, copy("assistant", [call("c1")]), copy("user", [result("c1")], "h2"), user("After the copies", "u3")]
     for (const [from, to] of [[0, 0], [1, 2], [2, 5], [5, 5]]) expect((await window(reader, rows, from, to)).meta.global.unknown_links).toBe(0)
   }, 30000)
-  test(`${reader}: a message on any other record type is never a call, result or link`, async () => {
+  test(`${reader}: a message on any other record type is unknown and never a call, result or link`, async () => {
     const system = { type: "system", ...base, uuid: "s1", message: { role: "assistant", content: [call("ghost"), result("c1", "GHOST")] } }
-    const rows = [...turn, system]
+    for (const stray of [system, { ...system, message: "GHOST" }, { ...system, message: { role: "user", content: "GHOST".repeat(200) } }]) {
+      const rows = [...turn, stray]
+      const out = await whole(reader, rows)
+      expect([out.meta.unknown_records, out.meta.unmatched_calls, out.meta.unmatched_results, out.meta.truncated]).toEqual([1, 0, 0, 0])
+      expect(out.meta.tool_observations.map((o: any) => o.call_id)).toEqual(["c1"])
+      const selected = await window(reader, rows, 3)
+      expect([selected.meta.global.unknown_records, selected.meta.global.unknown_links, selected.meta.truncated]).toEqual([1, 0, 0])
+      expect(selected.meta.selection.closure_records).toBe(0)
+      expect(JSON.stringify(selected)).not.toContain("GHOST")
+    }
+  }, 30000)
+  test(`${reader}: a tool block that cannot be fingerprinted still reads whole`, async () => {
+    // A string cut inside a surrogate pair serializes to a lone escape.
+    const rows = [prompt, assistant([call("c1")]), user([result("c1", "cut \ud83d")], "u2"), copy("assistant", [call("c1")])]
     const out = await whole(reader, rows)
     clear(out.meta)
     expect(out.meta.tool_observations.map((o: any) => o.call_id)).toEqual(["c1"])
-    const selected = await window(reader, rows, 3)
-    clear(selected.meta.global)
-    expect(selected.meta.selection.closure_records).toBe(0)
-    expect(JSON.stringify(selected)).not.toContain("GHOST")
-    // A message that is not an object stays unknown on every record type.
-    expect((await whole(reader, [...turn, { ...system, message: "GHOST" }])).meta.unknown_records).toBeGreaterThan(0)
+    expect((await whole(reader, [...rows, copy("user", [result("absent")], "h2")])).meta.unknown_records).toBe(1)
   }, 30000)
   test(`${reader}: copy shape drift stays an unknown record`, async () => {
     const good = () => copy("assistant", [{ type: "text", text: "COPY" }, call("c1")]) as any
@@ -203,6 +211,11 @@ for (const reader of readers) {
       const held = await window(reader, [...turn, value], 0)
       expect(held.meta.global.unknown_records).toBeGreaterThan(0)
       expect(held.meta.unknown_records).toBeGreaterThan(0)
+    }
+    // JSON.stringify cannot write a non-finite number, so the text is patched.
+    for (const number of ["Infinity", "-Infinity", "NaN"]) {
+      const text = bytes([...turn, { ...journal["cost-state"], totalCostUSD: 987654321 }]).toString().replace("987654321", number)
+      expect((await execute([join(scripts, reader), "--json"], Buffer.from(text))).meta.unknown_records).toBe(1)
     }
   }, 30000)
   test(`${reader}: every recognized attachment is unread evidence that holds only when selected`, async () => {
@@ -264,7 +277,8 @@ test("a queued prompt, a copied user message and a message on another record typ
   expect(filtered.boundaries).toEqual([listed.boundaries[4]])
   expect(filtered.meta.boundaries.total).toBe(1)
   expect(filtered.meta.omitted).toBe(1)
-  clear(filtered.meta.global)
+  // The stray message is the one unknown record; the copies and the queued prompt are recognized.
+  expect([filtered.meta.global.unknown_records, filtered.meta.global.unknown_links]).toEqual([1, 0])
 }, 30000)
 
 test("copied identities are charged to the unchanged streamed index", async () => {
