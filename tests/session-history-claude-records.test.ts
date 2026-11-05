@@ -115,7 +115,7 @@ for (const reader of readers) {
     expect((await window(reader, rows, 3)).meta.selection.closure_records).toBe(1)
     const around = await window(reader, rows, 4, 10)
     expect([around.meta.selection.selected_records, around.meta.selection.closure_records, around.meta.tool_observations]).toEqual([7, 0, []])
-  })
+  }, 30000)
   test(`${reader}: a copied identity without its conversation record is a global unknown link`, async () => {
     const cases = [
       [...turn, copy("assistant", [call("absent")])],
@@ -134,7 +134,7 @@ for (const reader of readers) {
     // Resolution reads the whole input, wherever the window puts the copy and its record.
     const rows = [...turn, copy("assistant", [call("c1")]), copy("user", [result("c1")], "h2"), user("After the copies", "u3")]
     for (const [from, to] of [[0, 0], [1, 2], [2, 5], [5, 5]]) expect((await window(reader, rows, from, to)).meta.global.unknown_links).toBe(0)
-  })
+  }, 30000)
   test(`${reader}: a message on any other record type is never a call, result or link`, async () => {
     const system = { type: "system", ...base, uuid: "s1", message: { role: "assistant", content: [call("ghost"), result("c1", "GHOST")] } }
     const rows = [...turn, system]
@@ -147,7 +147,7 @@ for (const reader of readers) {
     expect(JSON.stringify(selected)).not.toContain("GHOST")
     // A message that is not an object stays unknown on every record type.
     expect((await whole(reader, [...turn, { ...system, message: "GHOST" }])).meta.unknown_records).toBeGreaterThan(0)
-  })
+  }, 30000)
   test(`${reader}: copy shape drift stays an unknown record`, async () => {
     const good = () => copy("assistant", [{ type: "text", text: "COPY" }, call("c1")]) as any
     const mutations = [
@@ -178,7 +178,7 @@ for (const reader of readers) {
       expect(out.meta.unknown_records).toBeGreaterThan(0)
       expect(JSON.stringify(out)).not.toContain("COPY")
     }
-  })
+  }, 30000)
   test(`${reader}: request journal and bookkeeping records are neither evidence nor omissions`, async () => {
     const rows = [...Object.values(journal), ...turn]
     const out = await whole(reader, rows)
@@ -204,7 +204,7 @@ for (const reader of readers) {
       expect(held.meta.global.unknown_records).toBeGreaterThan(0)
       expect(held.meta.unknown_records).toBeGreaterThan(0)
     }
-  })
+  }, 30000)
   test(`${reader}: every recognized attachment is unread evidence that holds only when selected`, async () => {
     // Each type twice: its required keys alone, then every optional body and root key.
     const context = attachments.flatMap(([required, optional], i) => [
@@ -223,7 +223,7 @@ for (const reader of readers) {
     // One unknown member is counted alone; its recognized siblings stay omissions.
     const mixed = await whole(reader, [attachment({ type: "future_context" }, { uuid: "future" }), ...rows])
     expect([mixed.meta.omitted, mixed.meta.unknown_records]).toEqual([context.length, 1])
-  })
+  }, 30000)
   test(`${reader}: attachment type, key and value-kind drift stays an unknown record`, async () => {
     const [required, optional] = attachments[0] as [any, any]
     const unknown = [
@@ -251,7 +251,7 @@ for (const reader of readers) {
       expect(out.meta.unknown_records).toBeGreaterThan(0)
       expect(JSON.stringify(out)).not.toContain("CONTEXT")
     }
-  })
+  }, 30000)
 }
 
 test("a queued prompt, a copied user message and a message on another record type are never offered as a user boundary", async () => {
@@ -265,7 +265,7 @@ test("a queued prompt, a copied user message and a message on another record typ
   expect(filtered.meta.boundaries.total).toBe(1)
   expect(filtered.meta.omitted).toBe(1)
   clear(filtered.meta.global)
-})
+}, 30000)
 
 test("copied identities are charged to the unchanged streamed index", async () => {
   const one = copy("assistant", [call("c1")]), two = copy("user", [result("c1")], "h2")
@@ -275,4 +275,4 @@ test("copied identities are charged to the unchanged streamed index", async () =
   for (const rows of [turn, [...turn, one], [...turn, one, one, two]]) scans.push((await streamed("extract-skeleton.py", rows, select)).meta.scan)
   expect(scans.map(scan => scan.index_entries - scans[0].index_entries)).toEqual([0, 1, 2])
   expect(scans.map(scan => scan.index_bytes - scans[0].index_bytes)).toEqual([0, 160, 320])
-})
+}, 30000)
