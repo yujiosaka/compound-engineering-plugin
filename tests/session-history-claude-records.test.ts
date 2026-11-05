@@ -140,13 +140,18 @@ for (const reader of readers) {
     for (const stray of [system, { ...system, message: "GHOST" }, { ...system, message: { role: "user", content: "GHOST".repeat(200) } }]) {
       const rows = [...turn, stray]
       const out = await whole(reader, rows)
-      expect([out.meta.unknown_records, out.meta.unmatched_calls, out.meta.unmatched_results, out.meta.truncated]).toEqual([1, 0, 0, 0])
+      expect([out.meta.unknown_records, out.meta.identity_conflicts, out.meta.unmatched_calls, out.meta.unmatched_results, out.meta.truncated]).toEqual([1, 0, 0, 0, 0])
       expect(out.meta.tool_observations.map((o: any) => o.call_id)).toEqual(["c1"])
       const selected = await window(reader, rows, 3)
-      expect([selected.meta.global.unknown_records, selected.meta.global.unknown_links, selected.meta.truncated]).toEqual([1, 0, 0])
+      const global = selected.meta.global
+      expect([global.unknown_records, global.unknown_links, global.identity_conflicts, global.unmatched_calls, global.unmatched_results, selected.meta.truncated]).toEqual([1, 0, 0, 0, 0, 0])
       expect(selected.meta.selection.closure_records).toBe(0)
       expect(JSON.stringify(selected)).not.toContain("GHOST")
     }
+    // A copied call does not resolve through a stray record that names the same ID.
+    const rows = [...turn, system, copy("assistant", [call("ghost")])]
+    expect((await whole(reader, rows)).meta.unknown_records).toBe(2)
+    expect((await window(reader, rows, 0)).meta.global.unknown_links).toBe(1)
   }, 30000)
   test(`${reader}: a tool block that cannot be fingerprinted still reads whole`, async () => {
     // A string cut inside a surrogate pair serializes to a lone escape.
@@ -155,6 +160,11 @@ for (const reader of readers) {
     clear(out.meta)
     expect(out.meta.tool_observations.map((o: any) => o.call_id)).toEqual(["c1"])
     expect((await whole(reader, [...rows, copy("user", [result("absent")], "h2")])).meta.unknown_records).toBe(1)
+    // JSON.stringify cannot write a non-finite number, so the text is patched.
+    const numbered = [prompt, assistant([{ ...call("c1"), input: { command: "check", limit: 987654321 } }]), user([result("c1")], "u2"), copy("assistant", [call("c1")])]
+    const nan = await execute([join(scripts, reader), "--json"], Buffer.from(bytes(numbered).toString().replace("987654321", "NaN")))
+    clear(nan.meta)
+    expect(nan.meta.tool_observations.map((o: any) => o.call_id)).toEqual(["c1"])
   }, 30000)
   test(`${reader}: copy shape drift stays an unknown record`, async () => {
     const good = () => copy("assistant", [{ type: "text", text: "COPY" }, call("c1")]) as any
